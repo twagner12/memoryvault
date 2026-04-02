@@ -41,10 +41,16 @@
         </div>
     </div>
 
-    <!-- Current file -->
-    <div class="bg-gray-50 rounded-lg border border-gray-200 p-4">
-        <p class="text-xs text-gray-400 mb-1">Current file</p>
-        <p class="text-sm text-gray-700 font-mono truncate" id="current-file">Waiting...</p>
+    <!-- Current file + elapsed time -->
+    <div class="flex gap-4">
+        <div class="flex-1 bg-gray-50 rounded-lg border border-gray-200 p-4">
+            <p class="text-xs text-gray-400 mb-1">Current file</p>
+            <p class="text-sm text-gray-700 font-mono truncate" id="current-file">Waiting...</p>
+        </div>
+        <div class="bg-gray-50 rounded-lg border border-gray-200 p-4 min-w-[140px] text-center">
+            <p class="text-xs text-gray-400 mb-1">Elapsed</p>
+            <p class="text-sm text-gray-700 font-medium" id="elapsed-time">0:00</p>
+        </div>
     </div>
 
     <!-- Done button (hidden initially) -->
@@ -62,6 +68,14 @@
 
 <script>
     const taskId = "{{ task_id }}";
+
+    function formatElapsed(seconds) {
+        const hrs = Math.floor(seconds / 3600);
+        const mins = Math.floor((seconds % 3600) / 60);
+        const secs = Math.floor(seconds % 60);
+        if (hrs > 0) return hrs + ':' + String(mins).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+        return mins + ':' + String(secs).padStart(2, '0');
+    }
 
     function pollTask() {
         fetch(`/api/tasks/${taskId}`)
@@ -85,6 +99,9 @@
                     document.getElementById('status-text').textContent = 'Starting...';
                 } else if (stage === 'progress') {
                     document.getElementById('status-text').textContent = 'Processing files...';
+                    if (p.elapsed !== undefined) {
+                        document.getElementById('elapsed-time').textContent = formatElapsed(p.elapsed);
+                    }
                     document.getElementById('progress-count').textContent =
                         formatNumber(processed) + ' files processed';
                     document.getElementById('progress-pct').textContent = '';
@@ -117,7 +134,11 @@
                 // Check if done
                 if (data.status === 'complete') {
                     document.getElementById('progress-bar').style.width = '100%';
+                    document.getElementById('progress-bar').classList.remove('animate-pulse', 'opacity-60');
                     document.getElementById('progress-pct').textContent = '100%';
+                    if (data.result && data.result.elapsed !== undefined) {
+                        document.getElementById('elapsed-time').textContent = formatElapsed(data.result.elapsed);
+                    }
                     document.getElementById('status-text').textContent = 'Complete!';
                     document.getElementById('current-file').textContent = 'Done';
                     document.getElementById('done-actions').classList.remove('hidden');

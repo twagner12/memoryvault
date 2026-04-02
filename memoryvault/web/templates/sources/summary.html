@@ -51,6 +51,21 @@
             </div>
         </div>
         {% endif %}
+
+        {% if task.result.get('elapsed') %}
+        <div class="mt-6 pt-4 border-t border-gray-100 text-center">
+            <p class="text-sm text-gray-400">Completed in
+                {% set elapsed = task.result.get('elapsed', 0) %}
+                {% if elapsed >= 3600 %}
+                    {{ "%d"|format(elapsed // 3600) }}h {{ "%d"|format((elapsed % 3600) // 60) }}m {{ "%d"|format(elapsed % 60) }}s
+                {% elif elapsed >= 60 %}
+                    {{ "%d"|format(elapsed // 60) }}m {{ "%d"|format(elapsed % 60) }}s
+                {% else %}
+                    {{ "%d"|format(elapsed) }}s
+                {% endif %}
+            </p>
+        </div>
+        {% endif %}
     </div>
     {% endif %}
 

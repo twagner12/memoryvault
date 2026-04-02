@@ -69,40 +69,50 @@ class TaskManager:
         return tasks[:limit]
 
     def _run_scan(self, task: TaskInfo, folder: str, db_path: str, source: str):
+        import time
+        start_time = time.time()
         task.status = "running"
         task.add_event({"stage": "started", "type": "scan", "folder": folder})
 
         def progress(stage, total, current, error=None):
-            task.progress = {"stage": stage, "total": total, "current": current}
+            elapsed = time.time() - start_time
+            task.progress = {"stage": stage, "total": total, "current": current,
+                             "elapsed": round(elapsed, 1)}
             task.add_event({
                 "stage": stage, "total": total, "current": current,
-                "error": error,
+                "error": error, "elapsed": round(elapsed, 1),
             })
 
         try:
             db = Database(Path(db_path))
             count = scan_folder(Path(folder), db, source=source, progress_callback=progress)
             db.close()
-            task.result = {"scanned": count}
+            elapsed = round(time.time() - start_time, 1)
+            task.result = {"scanned": count, "elapsed": elapsed}
             task.status = "complete"
-            task.add_event({"stage": "complete", "scanned": count})
+            task.add_event({"stage": "complete", "scanned": count, "elapsed": elapsed})
         except Exception as e:
             task.error = str(e)
             task.status = "error"
             task.add_event({"stage": "error", "error": str(e)})
 
     def _run_ingest(self, task: TaskInfo, archive: str, dest: str, db_path: str):
+        import time
+        start_time = time.time()
         task.status = "running"
         task.add_event({"stage": "started", "type": "ingest", "archive": archive})
 
         def progress(stage, **kwargs):
-            task.progress = {"stage": stage, **kwargs}
-            task.add_event({"stage": stage, **kwargs})
+            elapsed = time.time() - start_time
+            task.progress = {"stage": stage, "elapsed": round(elapsed, 1), **kwargs}
+            task.add_event({"stage": stage, "elapsed": round(elapsed, 1), **kwargs})
 
         try:
             db = Database(Path(db_path))
             stats = ingest_archive(Path(archive), Path(dest), db, progress_callback=progress)
             db.close()
+            elapsed = round(time.time() - start_time, 1)
+            stats["elapsed"] = elapsed
             task.result = stats
             task.status = "complete"
             task.add_event({"stage": "complete", **stats})
