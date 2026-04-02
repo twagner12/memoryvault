@@ -76,21 +76,42 @@
                 const stage = p.stage || data.status;
 
                 // Update status text
+                const processed = p.processed || p.current || 0;
+
                 if (stage === 'listing') {
-                    document.getElementById('status-text').textContent = 'Listing files on disk (this may take a few minutes on large drives)...';
+                    document.getElementById('status-text').textContent = 'Listing files (this may take a few minutes on large drives)...';
                     document.getElementById('current-file').textContent = 'Walking directory tree...';
-                } else if (stage === 'start' && p.total) {
-                    document.getElementById('status-text').textContent = 'Found ' + formatNumber(p.total) + ' files. Scanning...';
-                } else if (stage === 'progress' && p.total) {
-                    document.getElementById('status-text').textContent = 'Scanning files...';
-                    const pct = Math.round((p.current / p.total) * 100);
-                    document.getElementById('progress-bar').style.width = pct + '%';
-                    document.getElementById('progress-pct').textContent = pct + '%';
+                } else if (stage === 'start') {
+                    document.getElementById('status-text').textContent = 'Starting...';
+                } else if (stage === 'progress') {
+                    document.getElementById('status-text').textContent = 'Processing files...';
                     document.getElementById('progress-count').textContent =
-                        formatNumber(p.current) + ' / ' + formatNumber(p.total) + ' files';
-                    document.getElementById('stat-kept').textContent = formatNumber(p.current);
+                        formatNumber(processed) + ' files processed';
+                    document.getElementById('progress-pct').textContent = '';
+
+                    // Animate progress bar as indeterminate or with real percentage
+                    if (p.total && p.total > 0 && p.total !== processed) {
+                        const pct = Math.round(processed / p.total * 100);
+                        document.getElementById('progress-bar').style.width = pct + '%';
+                        document.getElementById('progress-pct').textContent = pct + '%';
+                    } else {
+                        // Indeterminate — pulse the bar
+                        document.getElementById('progress-bar').style.width = '100%';
+                        document.getElementById('progress-bar').classList.add('animate-pulse', 'opacity-60');
+                    }
+
+                    if (p.path) {
+                        document.getElementById('current-file').textContent = p.path;
+                    }
+
+                    // Update individual stat counters from ingest
+                    if (p.kept !== undefined) document.getElementById('stat-kept').textContent = formatNumber(p.kept);
+                    if (p.skipped !== undefined) document.getElementById('stat-skipped').textContent = formatNumber(p.skipped);
+                    if (p.errors !== undefined) document.getElementById('stat-errors').textContent = formatNumber(p.errors);
+                    if (p.merged !== undefined) document.getElementById('stat-metadata').textContent = formatNumber(p.merged);
                 } else if (data.status === 'running') {
                     document.getElementById('status-text').textContent = 'Processing...';
+                    document.getElementById('progress-pct').textContent = '';
                 }
 
                 // Check if done

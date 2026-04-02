@@ -15,9 +15,9 @@ def index():
     dupe_count = sum(len(g) - 1 for g in dupe_groups)
     wasted_bytes = sum(sum(f["size"] for f in g[1:]) for g in dupe_groups) if dupe_groups else 0
 
-    # Recent archives
+    # Recent archives — only show completed ones
     archives = db.conn.execute(
-        "SELECT * FROM archives ORDER BY id DESC LIMIT 5"
+        "SELECT * FROM archives WHERE status = 'complete' ORDER BY id DESC LIMIT 5"
     ).fetchall()
 
     return render_template("dashboard.html",

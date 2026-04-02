@@ -1,5 +1,6 @@
 """Source wizard blueprint — add folders and zips via guided workflow."""
 
+import os
 from pathlib import Path
 
 from flask import Blueprint, current_app, flash, redirect, render_template, request, url_for
@@ -9,7 +10,8 @@ bp = Blueprint("sources", __name__)
 
 @bp.route("/new")
 def wizard():
-    return render_template("sources/wizard.html")
+    home_dir = os.path.expanduser("~")
+    return render_template("sources/wizard.html", home_dir=home_dir)
 
 
 @bp.route("/scan", methods=["POST"])

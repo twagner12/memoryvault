@@ -67,14 +67,20 @@
 
         <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-8">
             <h3 class="text-lg font-semibold text-gray-900 mb-1">Scan a Local Folder</h3>
-            <p class="text-sm text-gray-500 mb-6">Enter the full path to the folder you want to scan.</p>
+            <p class="text-sm text-gray-500 mb-6">Select the folder you want to scan.</p>
 
             <form action="{{ url_for('sources.scan') }}" method="POST">
                 <div class="mb-4">
                     <label class="block text-sm font-medium text-gray-700 mb-2">Folder path</label>
-                    <input type="text" name="folder" required
-                           placeholder="/run/media/tim/Seagate Backup Plus Drive"
-                           class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-sm">
+                    <div class="flex gap-2">
+                        <input type="text" name="folder" id="scan-folder" required
+                               placeholder="Click Browse to select a folder"
+                               class="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-sm">
+                        <button type="button" onclick="openBrowser('scan-folder', 'folder')"
+                                class="px-4 py-3 bg-gray-100 text-gray-700 font-medium rounded-lg hover:bg-gray-200 transition text-sm whitespace-nowrap">
+                            Browse
+                        </button>
+                    </div>
                 </div>
                 <div class="mb-6">
                     <label class="block text-sm font-medium text-gray-700 mb-2">Source label</label>
@@ -102,20 +108,32 @@
 
         <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-8">
             <h3 class="text-lg font-semibold text-gray-900 mb-1">Import Google Takeout</h3>
-            <p class="text-sm text-gray-500 mb-6">Enter the path to your Takeout zip file and where to save unique files.</p>
+            <p class="text-sm text-gray-500 mb-6">Select your Takeout zip file and where to save unique files.</p>
 
             <form action="{{ url_for('sources.ingest') }}" method="POST">
                 <div class="mb-4">
                     <label class="block text-sm font-medium text-gray-700 mb-2">Takeout zip file</label>
-                    <input type="text" name="archive" required
-                           placeholder="/home/tim/Downloads/takeout-20260401.zip"
-                           class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500 text-sm">
+                    <div class="flex gap-2">
+                        <input type="text" name="archive" id="ingest-archive" required
+                               placeholder="Click Browse to select a zip file"
+                               class="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500 text-sm">
+                        <button type="button" onclick="openBrowser('ingest-archive', 'file')"
+                                class="px-4 py-3 bg-gray-100 text-gray-700 font-medium rounded-lg hover:bg-gray-200 transition text-sm whitespace-nowrap">
+                            Browse
+                        </button>
+                    </div>
                 </div>
                 <div class="mb-6">
                     <label class="block text-sm font-medium text-gray-700 mb-2">Destination folder</label>
-                    <input type="text" name="dest" required
-                           placeholder="/run/media/tim/Seagate Backup Plus Drive/cloud_imports"
-                           class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500 text-sm">
+                    <div class="flex gap-2">
+                        <input type="text" name="dest" id="ingest-dest" required
+                               placeholder="Click Browse to select a destination"
+                               class="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500 text-sm">
+                        <button type="button" onclick="openBrowser('ingest-dest', 'folder')"
+                                class="px-4 py-3 bg-gray-100 text-gray-700 font-medium rounded-lg hover:bg-gray-200 transition text-sm whitespace-nowrap">
+                            Browse
+                        </button>
+                    </div>
                     <p class="text-xs text-gray-400 mt-1">Unique files will be saved here. Duplicates are skipped automatically.</p>
                 </div>
                 <button type="submit"
@@ -127,12 +145,242 @@
     </div>
 </div>
 
+<!-- File browser modal -->
+<div id="browser-modal" class="hidden fixed inset-0 z-50 overflow-y-auto">
+    <div class="flex items-center justify-center min-h-screen px-4">
+        <div class="fixed inset-0 bg-black bg-opacity-40" onclick="closeBrowser()"></div>
+        <div class="bg-white rounded-xl shadow-2xl border border-gray-200 w-full max-w-2xl relative z-10">
+            <!-- Header -->
+            <div class="flex items-center justify-between px-6 py-4 border-b border-gray-200">
+                <h3 class="text-lg font-semibold text-gray-900" id="browser-title">Select Folder</h3>
+                <button onclick="closeBrowser()" class="text-gray-400 hover:text-gray-600">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                    </svg>
+                </button>
+            </div>
+
+            <!-- Current path -->
+            <div class="px-6 py-3 bg-gray-50 border-b border-gray-200">
+                <p class="text-sm text-gray-600 font-mono truncate" id="browser-path">/home</p>
+            </div>
+
+            <!-- Quick access -->
+            <div class="px-6 py-2 border-b border-gray-100 flex gap-2 overflow-x-auto">
+                <button onclick="browseTo(homeDir)" class="px-3 py-1 text-xs bg-gray-100 text-gray-600 rounded-full hover:bg-gray-200 whitespace-nowrap">Home</button>
+                <button onclick="browseTo(homeDir + '/Downloads')" class="px-3 py-1 text-xs bg-gray-100 text-gray-600 rounded-full hover:bg-gray-200 whitespace-nowrap">Downloads</button>
+                <button onclick="browseTo('/run/media')" class="px-3 py-1 text-xs bg-gray-100 text-gray-600 rounded-full hover:bg-gray-200 whitespace-nowrap">Drives</button>
+            </div>
+
+            <!-- File list -->
+            <div class="max-h-96 overflow-y-auto" id="browser-list">
+                <div class="px-6 py-8 text-center text-gray-400">Loading...</div>
+            </div>
+
+            <!-- New folder input (hidden by default) -->
+            <div id="new-folder-bar" class="hidden px-6 py-3 border-t border-gray-200 flex gap-2">
+                <input type="text" id="new-folder-name" placeholder="New folder name"
+                       class="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                       onkeydown="if(event.key==='Enter'){createFolder();event.preventDefault()}">
+                <button onclick="createFolder()"
+                        class="px-4 py-2 text-sm text-white bg-blue-600 rounded-lg hover:bg-blue-700">
+                    Create
+                </button>
+                <button onclick="hideNewFolder()"
+                        class="px-4 py-2 text-sm text-gray-600 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">
+                    Cancel
+                </button>
+            </div>
+
+            <!-- Footer -->
+            <div class="flex items-center justify-between px-6 py-4 border-t border-gray-200 bg-gray-50 rounded-b-xl">
+                <div class="flex items-center gap-3">
+                    <button onclick="showNewFolder()" id="new-folder-btn"
+                            class="px-3 py-1.5 text-sm text-gray-600 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 inline-flex items-center">
+                        <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/>
+                        </svg>
+                        New Folder
+                    </button>
+                    <p class="text-sm text-gray-500 truncate max-w-sm" id="browser-selected">No selection</p>
+                </div>
+                <div class="flex gap-2">
+                    <button onclick="closeBrowser()"
+                            class="px-4 py-2 text-sm text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">
+                        Cancel
+                    </button>
+                    <button onclick="confirmBrowser()"
+                            class="px-4 py-2 text-sm text-white bg-blue-600 rounded-lg hover:bg-blue-700" id="browser-confirm">
+                        Select
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <script>
 function showStep(step) {
     document.getElementById('step-type').classList.add('hidden');
     document.getElementById('step-scan').classList.add('hidden');
     document.getElementById('step-ingest').classList.add('hidden');
     document.getElementById('step-' + step).classList.remove('hidden');
+}
+
+// File browser
+const homeDir = '{{ home_dir }}';
+let browserTargetInput = null;
+let browserMode = 'folder';
+let browserCurrentPath = '';
+let browserSelectedPath = '';
+
+function openBrowser(inputId, mode) {
+    browserTargetInput = document.getElementById(inputId);
+    browserMode = mode;
+    document.getElementById('browser-modal').classList.remove('hidden');
+    document.getElementById('browser-title').textContent =
+        mode === 'folder' ? 'Select Folder' : 'Select File';
+
+    // Start from current input value or home
+    const startPath = browserTargetInput.value || homeDir;
+    browseTo(startPath);
+}
+
+function closeBrowser() {
+    document.getElementById('browser-modal').classList.add('hidden');
+}
+
+function confirmBrowser() {
+    if (browserSelectedPath && browserTargetInput) {
+        browserTargetInput.value = browserSelectedPath;
+    }
+    closeBrowser();
+}
+
+function browseTo(path) {
+    browserCurrentPath = path;
+    browserSelectedPath = (browserMode === 'folder') ? path : '';
+    document.getElementById('browser-path').textContent = path;
+    document.getElementById('browser-selected').textContent =
+        browserSelectedPath ? browserSelectedPath : 'No selection';
+    document.getElementById('browser-list').innerHTML =
+        '<div class="px-6 py-8 text-center text-gray-400">Loading...</div>';
+
+    fetch(`/api/browse?path=${encodeURIComponent(path)}&mode=${browserMode}`)
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                document.getElementById('browser-list').innerHTML =
+                    `<div class="px-6 py-8 text-center text-red-500">${data.error}</div>`;
+                return;
+            }
+
+            // Update selected for folder mode
+            if (browserMode === 'folder') {
+                browserSelectedPath = data.path;
+                document.getElementById('browser-selected').textContent = data.path;
+                document.getElementById('browser-path').textContent = data.path;
+            }
+
+            let html = '';
+
+            // Parent directory
+            if (data.parent) {
+                html += `<button onclick="browseTo('${data.parent.replace(/'/g, "\\'")}')"
+                    class="w-full flex items-center px-6 py-3 hover:bg-gray-50 text-left border-b border-gray-50">
+                    <svg class="w-5 h-5 text-gray-400 mr-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 17l-5-5m0 0l5-5m-5 5h12"/>
+                    </svg>
+                    <span class="text-sm text-gray-500">..</span>
+                </button>`;
+            }
+
+            if (data.entries.length === 0) {
+                html += '<div class="px-6 py-8 text-center text-gray-400">Empty folder</div>';
+            }
+
+            for (const entry of data.entries) {
+                const isFolder = entry.type === 'folder';
+                const icon = isFolder
+                    ? `<svg class="w-5 h-5 text-yellow-500 mr-3 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">
+                         <path d="M10 4H4a2 2 0 00-2 2v12a2 2 0 002 2h16a2 2 0 002-2V8a2 2 0 00-2-2h-8l-2-2z"/>
+                       </svg>`
+                    : `<svg class="w-5 h-5 text-gray-400 mr-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/>
+                       </svg>`;
+
+                const sizeText = entry.size ? `<span class="text-xs text-gray-400 ml-auto">${formatBytes(entry.size)}</span>` : '';
+
+                if (isFolder) {
+                    html += `<button onclick="browseTo('${entry.path.replace(/'/g, "\\'")}')"
+                        class="w-full flex items-center px-6 py-3 hover:bg-gray-50 text-left border-b border-gray-50">
+                        ${icon}
+                        <span class="text-sm text-gray-900 truncate">${entry.name}</span>
+                        ${sizeText}
+                    </button>`;
+                } else {
+                    html += `<button onclick="selectFile('${entry.path.replace(/'/g, "\\'")}')"
+                        class="w-full flex items-center px-6 py-3 hover:bg-blue-50 text-left border-b border-gray-50 file-entry"
+                        data-path="${entry.path}">
+                        ${icon}
+                        <span class="text-sm text-gray-900 truncate">${entry.name}</span>
+                        ${sizeText}
+                    </button>`;
+                }
+            }
+
+            document.getElementById('browser-list').innerHTML = html;
+        })
+        .catch(err => {
+            document.getElementById('browser-list').innerHTML =
+                `<div class="px-6 py-8 text-center text-red-500">Error loading: ${err}</div>`;
+        });
+}
+
+function selectFile(path) {
+    browserSelectedPath = path;
+    document.getElementById('browser-selected').textContent = path;
+
+    // Highlight selected
+    document.querySelectorAll('.file-entry').forEach(el => {
+        el.classList.remove('bg-blue-50', 'ring-1', 'ring-blue-300');
+    });
+    const selected = document.querySelector(`[data-path="${CSS.escape(path)}"]`);
+    if (selected) {
+        selected.classList.add('bg-blue-50', 'ring-1', 'ring-blue-300');
+    }
+}
+
+function showNewFolder() {
+    document.getElementById('new-folder-bar').classList.remove('hidden');
+    document.getElementById('new-folder-name').value = '';
+    document.getElementById('new-folder-name').focus();
+}
+
+function hideNewFolder() {
+    document.getElementById('new-folder-bar').classList.add('hidden');
+}
+
+function createFolder() {
+    const name = document.getElementById('new-folder-name').value.trim();
+    if (!name) return;
+
+    fetch('/api/mkdir', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({parent: browserCurrentPath, name: name})
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.error) {
+            alert(data.error);
+            return;
+        }
+        hideNewFolder();
+        // Navigate into the new folder
+        browseTo(data.path);
+    })
+    .catch(err => alert('Error creating folder: ' + err));
 }
 </script>
 {% endblock %}

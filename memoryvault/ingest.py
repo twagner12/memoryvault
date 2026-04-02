@@ -39,9 +39,24 @@ def is_metadata_json(path: str) -> bool:
     return Path(path).name.lower() == "metadata.json"
 
 
+def _media_name_for_sidecar(sidecar_path: str) -> str | None:
+    """Given a sidecar JSON path, return the media file path it belongs to."""
+    if sidecar_path.endswith(".supplemental-metadata.json"):
+        return sidecar_path[:-len(".supplemental-metadata.json")]
+    elif sidecar_path.endswith(".json"):
+        return sidecar_path[:-len(".json")]
+    return None
+
+
 def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
                    progress_callback=None) -> dict:
     """Ingest a Takeout zip: stream files, dedup against DB, keep unique files.
+
+    Single-pass streaming approach:
+    - Sidecars (small JSON) are buffered in memory
+    - Media files are processed immediately as they're encountered
+    - If a sidecar arrives before its media file, it's applied during processing
+    - If a sidecar arrives after its media file, it's applied retroactively
 
     Args:
         archive_path: Path to the zip file.
@@ -56,10 +71,11 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
     dest_folder.mkdir(parents=True, exist_ok=True)
 
     # Register archive and check for resume
-    entry_count = count_entries(archive_path)
-    archive_hash = None  # Skip hashing the zip itself for speed
+    # Skip count_entries() — it reads the entire zip and blocks on large files.
+    # We'll update the total as we go.
+    archive_hash = None
     archive_id = db.register_archive(str(archive_path), blake3=archive_hash,
-                                     entries_total=entry_count)
+                                     entries_total=0)
 
     archive_record = db.get_archive(str(archive_path))
     if archive_record["status"] == "complete":
@@ -72,66 +88,78 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
 
     stats = {"kept": 0, "skipped": 0, "errors": 0, "merged_metadata": 0}
 
-    # Pass 1: Collect all sidecar JSON data and buffer media entries
-    # We need sidecars parsed before processing media files because
-    # the sidecar may appear after its media file in the zip
+    # Sidecars are small (just JSON text) — safe to buffer
     sidecars: dict[str, dict] = {}
-    media_entries: list[ArchiveEntry] = []
+    # Track where media files were saved so late-arriving sidecars can be applied
+    kept_media: dict[str, str] = {}  # archive_path -> dest_path
+
+    processed_count = 0
+
+    if progress_callback:
+        progress_callback("start", processed=0, total=0)
 
     for entry in iter_entries(archive_path, skip_entries=already_processed):
-        if entry.data is None:
+        if entry.data is None and entry.temp_path is None:
             db.log_archive_entry(archive_id, entry.path, "error", skip_reason="corrupt")
             stats["errors"] += 1
+            processed_count += 1
             continue
 
         if is_metadata_json(entry.path):
             db.log_archive_entry(archive_id, entry.path, "skipped", skip_reason="album_metadata")
             stats["skipped"] += 1
+            processed_count += 1
             continue
 
         if is_sidecar_json(entry.path):
+            # Parse and store sidecar — these are tiny (< 1KB each)
             try:
-                sidecar_data = json.loads(entry.data.decode("utf-8"))
-                name = entry.path
-                if name.endswith(".supplemental-metadata.json"):
-                    media_name = name[:-len(".supplemental-metadata.json")]
-                elif name.endswith(".json"):
-                    media_name = name[:-len(".json")]
-                else:
-                    media_name = None
-
+                raw = entry.read_data()
+                if not raw:
+                    continue
+                sidecar_data = json.loads(raw.decode("utf-8"))
+                media_name = _media_name_for_sidecar(entry.path)
                 if media_name:
                     parsed = _parse_sidecar_data(sidecar_data)
                     sidecars[media_name] = parsed
+
+                    # Check if we already saved this media file (sidecar arrived late)
+                    if media_name in kept_media:
+                        merged = _apply_sidecar_to_file(
+                            kept_media[media_name], parsed, entry.path, db)
+                        if merged:
+                            stats["merged_metadata"] += len(merged)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
             db.log_archive_entry(archive_id, entry.path, "skipped", skip_reason="sidecar")
             stats["skipped"] += 1
+            processed_count += 1
             continue
 
         if not is_media_file(entry.path):
             db.log_archive_entry(archive_id, entry.path, "skipped", skip_reason="not_media")
             stats["skipped"] += 1
+            processed_count += 1
             continue
 
-        # Buffer media entries for pass 2
-        media_entries.append(entry)
-
-    # Pass 2: Process media entries with all sidecars available
-    for entry in media_entries:
+        # Process media file immediately — no buffering
         result = _process_media_entry(entry, dest_folder, db, sidecars, archive_id)
         stats[result["action"]] += 1
         if result.get("merged"):
             stats["merged_metadata"] += len(result["merged"])
+        if result.get("dest_path"):
+            kept_media[entry.path] = result["dest_path"]
 
-        if progress_callback:
-            processed = stats["kept"] + stats["skipped"] + stats["errors"]
-            progress_callback("progress", processed=processed, total=entry_count,
-                              action=result["action"], path=entry.path)
+        processed_count += 1
+
+        if progress_callback and processed_count % 10 == 0:
+            progress_callback("progress", processed=processed_count, total=processed_count,
+                              action=result["action"], path=entry.path,
+                              kept=stats["kept"], skipped=stats["skipped"],
+                              errors=stats["errors"], merged=stats["merged_metadata"])
 
     # Mark archive complete
-    total_processed = stats["kept"] + stats["skipped"] + stats["errors"]
-    db.update_archive_status(archive_id, "complete", entries_processed=total_processed)
+    db.update_archive_status(archive_id, "complete", entries_processed=processed_count)
 
     if progress_callback:
         progress_callback("done", stats=stats)
@@ -170,20 +198,60 @@ def _parse_sidecar_data(data: dict) -> dict:
     return result
 
 
+def _apply_sidecar_to_file(dest_path: str, sidecar: dict, source_desc: str,
+                           db: Database) -> list[str]:
+    """Apply sidecar metadata to an already-saved file (for late-arriving sidecars)."""
+    merged = []
+    path = Path(dest_path)
+    if not path.exists() or not can_have_exif(path):
+        return merged
+
+    if sidecar.get("date") and not get_exif_date(path):
+        try:
+            write_exif_date(path, sidecar["date"])
+            db.log_metadata_merge(dest_path, f"takeout:{source_desc}", "date", sidecar["date"])
+            merged.append("date")
+        except Exception:
+            pass
+
+    if sidecar.get("lat") is not None and not get_exif_gps(path):
+        try:
+            write_exif_gps(path, sidecar["lat"], sidecar["lon"])
+            db.log_metadata_merge(dest_path, f"takeout:{source_desc}", "gps",
+                                  f"{sidecar['lat']},{sidecar['lon']}")
+            merged.append("gps")
+        except Exception:
+            pass
+
+    return merged
+
+
 def _process_media_entry(entry: ArchiveEntry, dest_folder: Path, db: Database,
                          sidecars: dict, archive_id: int) -> dict:
     """Process a single media file from the archive.
 
-    Returns dict with 'action' ('kept', 'skipped', or 'errors') and optional 'merged' list.
+    Returns dict with 'action' ('kept', 'skipped', or 'errors'),
+    optional 'merged' list, and optional 'dest_path'.
     """
-    # Hash the file data
-    full_hash = hash_bytes(entry.data)
-    size = len(entry.data)
+    try:
+        return _process_media_entry_inner(entry, dest_folder, db, sidecars, archive_id)
+    finally:
+        entry.cleanup()
+
+
+def _process_media_entry_inner(entry: ArchiveEntry, dest_folder: Path, db: Database,
+                               sidecars: dict, archive_id: int) -> dict:
+    size = entry.size
+
+    # Hash the file — from disk for large files, from memory for small
+    if entry.is_large:
+        full_hash = hash_full(entry.temp_path)
+    else:
+        full_hash = hash_bytes(entry.data)
 
     # Check if we already have this exact file
     existing = db.get_files_by_full_hash(full_hash)
     if existing:
-        # Duplicate — skip it, but check if we can merge metadata
         merged = _try_merge_sidecar_to_existing(entry.path, existing[0], sidecars, db)
         db.log_archive_entry(archive_id, entry.path, "skipped", skip_reason="duplicate")
         return {"action": "skipped", "merged": merged}
@@ -191,13 +259,14 @@ def _process_media_entry(entry: ArchiveEntry, dest_folder: Path, db: Database,
     # Progressive check: same size files
     same_size = db.get_files_by_size(size)
     if same_size:
-        # Hash head for comparison
-        head_data = entry.data[:65_536]
-        head_hash = hash_bytes(head_data)
+        if entry.is_large:
+            from memoryvault.hasher import hash_head
+            head_hash = hash_head(entry.temp_path)
+        else:
+            head_hash = hash_bytes(entry.data[:65_536])
 
         for existing_file in same_size:
             if existing_file.get("blake3_head") == head_hash:
-                # Very likely a duplicate, check full hash
                 if existing_file.get("blake3_full") == full_hash:
                     merged = _try_merge_sidecar_to_existing(
                         entry.path, existing_file, sidecars, db)
@@ -215,7 +284,7 @@ def _process_media_entry(entry: ArchiveEntry, dest_folder: Path, db: Database,
         db.log_archive_entry(archive_id, entry.path, "error", skip_reason="write_failed")
         return {"action": "errors"}
 
-    # Apply sidecar metadata if available
+    # Apply sidecar metadata if available (sidecar arrived before media file)
     merged = []
     sidecar = sidecars.get(entry.path)
     if sidecar and can_have_exif(dest_path):
@@ -237,9 +306,10 @@ def _process_media_entry(entry: ArchiveEntry, dest_folder: Path, db: Database,
             except Exception:
                 pass
 
-    # Compute head/tail hashes for DB
-    head_hash = hash_bytes(entry.data[:65_536])
-    tail_hash = hash_bytes(entry.data[-4_096:]) if size > 4_096 else head_hash
+    # Compute head/tail hashes for DB — use the saved file on disk
+    from memoryvault.hasher import hash_head, hash_tail
+    head_hash = hash_head(dest_path)
+    tail_hash = hash_tail(dest_path) if size > 4_096 else head_hash
 
     # Check metadata on the saved file
     meta = has_metadata(dest_path) if can_have_exif(dest_path) else {
@@ -260,7 +330,7 @@ def _process_media_entry(entry: ArchiveEntry, dest_folder: Path, db: Database,
     )
 
     db.log_archive_entry(archive_id, entry.path, "kept", kept_path=str(dest_path))
-    return {"action": "kept", "merged": merged}
+    return {"action": "kept", "merged": merged, "dest_path": str(dest_path)}
 
 
 def _try_merge_sidecar_to_existing(entry_path: str, existing: dict,
