@@ -2,10 +2,9 @@
 
 from pathlib import Path
 
-import click
-
 from memoryvault.database import Database
 from memoryvault.hasher import hash_file_progressive
+from memoryvault.metadata import has_metadata
 
 
 BATCH_SIZE = 500
@@ -36,6 +35,9 @@ def scan_folder(folder: Path, db: Database, source: str = "local",
         try:
             info = hash_file_progressive(path)
             info["source"] = source
+            meta = has_metadata(path)
+            info["has_exif_date"] = meta["has_exif_date"]
+            info["has_exif_gps"] = meta["has_exif_gps"]
             batch.append(info)
         except OSError as e:
             if progress_callback:
