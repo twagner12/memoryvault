@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Summary — MemoryVault{% endblock %}
+
+{% block content %}
+<div class="p-8 max-w-3xl">
+    <div class="text-center mb-8">
+        {% if task.status == 'complete' %}
+        <div class="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
+            <svg class="w-8 h-8 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+            </svg>
+        </div>
+        <h2 class="text-2xl font-bold text-gray-900">
+            {% if task.type == 'scan' %}Scan Complete{% else %}Import Complete{% endif %}
+        </h2>
+        {% else %}
+        <div class="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
+            <svg class="w-8 h-8 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+            </svg>
+        </div>
+        <h2 class="text-2xl font-bold text-gray-900">Task Failed</h2>
+        <p class="text-red-600 mt-2">{{ task.error }}</p>
+        {% endif %}
+    </div>
+
+    {% if task.result %}
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-8">
+        {% if task.type == 'scan' %}
+        <div class="text-center">
+            <p class="text-4xl font-bold text-gray-900">{{ "{:,}".format(task.result.scanned) }}</p>
+            <p class="text-gray-500 mt-2">files scanned and indexed</p>
+        </div>
+        {% else %}
+        <div class="grid grid-cols-2 gap-6">
+            <div class="text-center p-4">
+                <p class="text-3xl font-bold text-green-600">{{ "{:,}".format(task.result.get('kept', 0)) }}</p>
+                <p class="text-sm text-gray-500 mt-1">unique files kept</p>
+            </div>
+            <div class="text-center p-4">
+                <p class="text-3xl font-bold text-yellow-600">{{ "{:,}".format(task.result.get('skipped', 0)) }}</p>
+                <p class="text-sm text-gray-500 mt-1">duplicates skipped</p>
+            </div>
+            <div class="text-center p-4">
+                <p class="text-3xl font-bold text-blue-600">{{ "{:,}".format(task.result.get('merged_metadata', 0)) }}</p>
+                <p class="text-sm text-gray-500 mt-1">metadata fields merged</p>
+            </div>
+            <div class="text-center p-4">
+                <p class="text-3xl font-bold text-red-600">{{ "{:,}".format(task.result.get('errors', 0)) }}</p>
+                <p class="text-sm text-gray-500 mt-1">errors</p>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+    {% endif %}
+
+    <div class="flex gap-4 mt-8 justify-center">
+        <a href="{{ url_for('sources.wizard') }}"
+           class="px-6 py-3 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition">
+            Add Another Source
+        </a>
+        <a href="{{ url_for('dashboard.index') }}"
+           class="px-6 py-3 bg-white text-gray-700 font-medium rounded-lg border border-gray-300 hover:bg-gray-50 transition">
+            Back to Dashboard
+        </a>
+    </div>
+</div>
+{% endblock %}

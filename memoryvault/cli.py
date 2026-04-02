@@ -190,3 +190,24 @@ def stats(ctx):
         click.echo(f"Wasted space:      {wasted / (1024**3):.1f} GB")
     finally:
         db.close()
+
+
+@cli.command()
+@click.option("--port", default=5000, help="Port to serve on.")
+@click.pass_context
+def serve(ctx, port):
+    """Launch the MemoryVault web UI."""
+    import webbrowser
+    from memoryvault.web import create_app
+
+    db_path = ctx.obj["db_path"]
+    app = create_app(db_path=str(db_path))
+
+    # Add basename filter for templates
+    @app.template_filter("basename")
+    def basename_filter(path):
+        return Path(path).name
+
+    click.echo(f"Starting MemoryVault at http://localhost:{port}")
+    webbrowser.open(f"http://localhost:{port}")
+    app.run(host="127.0.0.1", port=port, debug=False)

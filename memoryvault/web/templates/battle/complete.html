@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Battle Complete — MemoryVault{% endblock %}
+
+{% block content %}
+<div class="p-8 max-w-3xl mx-auto text-center">
+    <div class="mb-8">
+        <div class="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-6">
+            <svg class="w-10 h-10 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+            </svg>
+        </div>
+        <h2 class="text-3xl font-bold text-gray-900 mb-2">All Battles Complete!</h2>
+        <p class="text-gray-500">Your photo collection is deduplicated.</p>
+    </div>
+
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-8 mb-8">
+        <div class="grid grid-cols-2 gap-8">
+            <div>
+                <p class="text-4xl font-bold text-blue-600">{{ "{:,}".format(auto_resolved) }}</p>
+                <p class="text-sm text-gray-500 mt-2">Auto-resolved</p>
+                <p class="text-xs text-gray-400">100% confidence matches</p>
+            </div>
+            <div>
+                <p class="text-4xl font-bold text-amber-500">{{ "{:,}".format(manually_resolved) }}</p>
+                <p class="text-sm text-gray-500 mt-2">Manually reviewed</p>
+                <p class="text-xs text-gray-400">Via Photo Battle</p>
+            </div>
+        </div>
+
+        {% if space_freed > 0 %}
+        <div class="mt-8 pt-6 border-t border-gray-100">
+            <p class="text-5xl font-bold text-green-600">{{ "%.1f"|format(space_freed / 1073741824) }} GB</p>
+            <p class="text-sm text-gray-500 mt-2">Space can be freed</p>
+        </div>
+        {% endif %}
+    </div>
+
+    <div class="flex gap-4 justify-center">
+        <a href="{{ url_for('dashboard.index') }}"
+           class="px-6 py-3 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition">
+            Back to Dashboard
+        </a>
+        <a href="{{ url_for('sources.wizard') }}"
+           class="px-6 py-3 bg-white text-gray-700 font-medium rounded-lg border border-gray-300 hover:bg-gray-50 transition">
+            Add More Sources
+        </a>
+    </div>
+</div>
+{% endblock %}

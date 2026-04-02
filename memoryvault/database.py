@@ -54,9 +54,20 @@ CREATE TABLE IF NOT EXISTS metadata_log (
     merge_time TEXT
 );
 
+CREATE TABLE IF NOT EXISTS resolutions (
+    id INTEGER PRIMARY KEY,
+    blake3_full TEXT NOT NULL,
+    winner_path TEXT NOT NULL,
+    action TEXT NOT NULL,
+    confidence INTEGER DEFAULT 100,
+    resolved_at TEXT NOT NULL,
+    auto_resolved BOOLEAN DEFAULT FALSE
+);
+
 CREATE INDEX IF NOT EXISTS idx_files_blake3_full ON files(blake3_full);
 CREATE INDEX IF NOT EXISTS idx_files_size ON files(size);
 CREATE INDEX IF NOT EXISTS idx_files_blake3_head ON files(blake3_head);
+CREATE INDEX IF NOT EXISTS idx_resolutions_blake3 ON resolutions(blake3_full);
 """
 
 
@@ -218,3 +229,39 @@ class Database:
             (target_path, source_desc, field, value, datetime.now(timezone.utc).isoformat()),
         )
         self.conn.commit()
+
+    # --- Resolutions ---
+
+    def resolve_group(self, blake3_full: str, winner_path: str, action: str,
+                      confidence: int = 100, auto_resolved: bool = False):
+        self.conn.execute(
+            "INSERT INTO resolutions (blake3_full, winner_path, action, confidence, resolved_at, auto_resolved) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (blake3_full, winner_path, action, confidence,
+             datetime.now(timezone.utc).isoformat(), auto_resolved),
+        )
+        self.conn.commit()
+
+    def is_resolved(self, blake3_full: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM resolutions WHERE blake3_full = ?", (blake3_full,)
+        ).fetchone()
+        return row is not None
+
+    def get_resolved_hashes(self) -> set[str]:
+        rows = self.conn.execute("SELECT blake3_full FROM resolutions").fetchall()
+        return {r["blake3_full"] for r in rows}
+
+    def find_unresolved_duplicate_groups(self) -> list[list[dict]]:
+        """Find duplicate groups that haven't been resolved yet."""
+        resolved = self.get_resolved_hashes()
+        all_groups = self.find_duplicate_groups()
+        return [g for g in all_groups if g[0]["blake3_full"] not in resolved]
+
+    def get_resolution_stats(self) -> dict:
+        row = self.conn.execute(
+            "SELECT COUNT(*) as total, "
+            "SUM(CASE WHEN auto_resolved THEN 1 ELSE 0 END) as auto_count "
+            "FROM resolutions"
+        ).fetchone()
+        return {"total": row["total"], "auto_resolved": row["auto_count"]}

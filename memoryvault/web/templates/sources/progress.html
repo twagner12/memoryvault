@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}Processing — MemoryVault{% endblock %}
+
+{% block content %}
+<div class="p-8 max-w-3xl">
+    <h2 class="text-2xl font-bold text-gray-900 mb-2">
+        {% if task.type == 'scan' %}Scanning Folder{% else %}Importing Takeout{% endif %}
+    </h2>
+    <p class="text-gray-500 mb-8" id="status-text">Starting...</p>
+
+    <!-- Progress bar -->
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-8 mb-6">
+        <div class="w-full bg-gray-200 rounded-full h-4 mb-4">
+            <div id="progress-bar"
+                 class="bg-blue-600 h-4 rounded-full transition-all duration-300"
+                 style="width: 0%"></div>
+        </div>
+        <div class="flex justify-between text-sm text-gray-500">
+            <span id="progress-count">0 files processed</span>
+            <span id="progress-pct">0%</span>
+        </div>
+    </div>
+
+    <!-- Stats -->
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <div class="bg-white rounded-lg border border-gray-200 p-4 text-center">
+            <p class="text-2xl font-bold text-green-600" id="stat-kept">0</p>
+            <p class="text-xs text-gray-500 mt-1">Kept</p>
+        </div>
+        <div class="bg-white rounded-lg border border-gray-200 p-4 text-center">
+            <p class="text-2xl font-bold text-yellow-600" id="stat-skipped">0</p>
+            <p class="text-xs text-gray-500 mt-1">Skipped</p>
+        </div>
+        <div class="bg-white rounded-lg border border-gray-200 p-4 text-center">
+            <p class="text-2xl font-bold text-red-600" id="stat-errors">0</p>
+            <p class="text-xs text-gray-500 mt-1">Errors</p>
+        </div>
+        <div class="bg-white rounded-lg border border-gray-200 p-4 text-center">
+            <p class="text-2xl font-bold text-blue-600" id="stat-metadata">0</p>
+            <p class="text-xs text-gray-500 mt-1">Metadata Merged</p>
+        </div>
+    </div>
+
+    <!-- Current file -->
+    <div class="bg-gray-50 rounded-lg border border-gray-200 p-4">
+        <p class="text-xs text-gray-400 mb-1">Current file</p>
+        <p class="text-sm text-gray-700 font-mono truncate" id="current-file">Waiting...</p>
+    </div>
+
+    <!-- Done button (hidden initially) -->
+    <div id="done-actions" class="hidden mt-8 flex gap-4">
+        <a href="{{ url_for('sources.summary', task_id=task_id) }}"
+           class="px-6 py-3 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition">
+            View Summary
+        </a>
+        <a href="{{ url_for('sources.wizard') }}"
+           class="px-6 py-3 bg-white text-gray-700 font-medium rounded-lg border border-gray-300 hover:bg-gray-50 transition">
+            Add Another Source
+        </a>
+    </div>
+</div>
+
+<script>
+    const taskId = "{{ task_id }}";
+    let kept = 0, skipped = 0, errors = 0, metadata = 0;
+
+    watchTask(taskId,
+        function onProgress(data) {
+            // Update progress bar
+            if (data.total && data.current !== undefined) {
+                const pct = Math.round((data.current / data.total) * 100);
+                document.getElementById('progress-bar').style.width = pct + '%';
+                document.getElementById('progress-pct').textContent = pct + '%';
+                document.getElementById('progress-count').textContent =
+                    formatNumber(data.current) + ' / ' + formatNumber(data.total) + ' files';
+            }
+
+            // Update status
+            if (data.stage === 'started') {
+                document.getElementById('status-text').textContent = 'Processing...';
+            } else if (data.stage === 'progress') {
+                document.getElementById('status-text').textContent = 'Processing files...';
+                if (data.path) {
+                    document.getElementById('current-file').textContent = data.path;
+                }
+                if (data.action === 'kept') kept++;
+                else if (data.action === 'skipped') skipped++;
+                else if (data.action === 'errors') errors++;
+            } else if (data.stage === 'done' || data.stage === 'complete') {
+                // Use final stats if available
+                if (data.scanned !== undefined) kept = data.scanned;
+                if (data.kept !== undefined) kept = data.kept;
+                if (data.skipped !== undefined) skipped = data.skipped;
+                if (data.errors !== undefined) errors = data.errors;
+                if (data.merged_metadata !== undefined) metadata = data.merged_metadata;
+            }
+
+            document.getElementById('stat-kept').textContent = formatNumber(kept);
+            document.getElementById('stat-skipped').textContent = formatNumber(skipped);
+            document.getElementById('stat-errors').textContent = formatNumber(errors);
+            document.getElementById('stat-metadata').textContent = formatNumber(metadata);
+        },
+        function onDone(data) {
+            document.getElementById('progress-bar').style.width = '100%';
+            document.getElementById('progress-pct').textContent = '100%';
+            document.getElementById('status-text').textContent = 'Complete!';
+            document.getElementById('current-file').textContent = 'Done';
+            document.getElementById('done-actions').classList.remove('hidden');
+
+            // Update final stats
+            if (data.scanned !== undefined) {
+                document.getElementById('stat-kept').textContent = formatNumber(data.scanned);
+            }
+            if (data.kept !== undefined) {
+                document.getElementById('stat-kept').textContent = formatNumber(data.kept);
+                document.getElementById('stat-skipped').textContent = formatNumber(data.skipped || 0);
+                document.getElementById('stat-errors').textContent = formatNumber(data.errors || 0);
+                document.getElementById('stat-metadata').textContent = formatNumber(data.merged_metadata || 0);
+            }
+        },
+        function onError(err) {
+            document.getElementById('status-text').textContent = 'Error: ' + err;
+            document.getElementById('progress-bar').classList.remove('bg-blue-600');
+            document.getElementById('progress-bar').classList.add('bg-red-600');
+        }
+    );
+</script>
+{% endblock %}

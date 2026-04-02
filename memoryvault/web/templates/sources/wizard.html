@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% block title %}Add Source — MemoryVault{% endblock %}
+
+{% block content %}
+<div class="p-8 max-w-3xl">
+    <h2 class="text-2xl font-bold text-gray-900 mb-2">Add a Source</h2>
+    <p class="text-gray-500 mb-8">Choose where your files are coming from.</p>
+
+    <!-- Step 1: Choose source type -->
+    <div id="step-type" class="space-y-4">
+        <button onclick="showStep('scan')"
+                class="w-full bg-white rounded-xl shadow-sm border border-gray-200 p-6 text-left hover:border-blue-400 hover:shadow-md transition group">
+            <div class="flex items-center">
+                <div class="w-12 h-12 bg-blue-50 rounded-lg flex items-center justify-center mr-4 group-hover:bg-blue-100">
+                    <svg class="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
+                    </svg>
+                </div>
+                <div>
+                    <h3 class="text-lg font-semibold text-gray-900">Local Folder</h3>
+                    <p class="text-sm text-gray-500">Scan a folder on your computer or external drive</p>
+                </div>
+            </div>
+        </button>
+
+        <button onclick="showStep('ingest')"
+                class="w-full bg-white rounded-xl shadow-sm border border-gray-200 p-6 text-left hover:border-green-400 hover:shadow-md transition group">
+            <div class="flex items-center">
+                <div class="w-12 h-12 bg-green-50 rounded-lg flex items-center justify-center mr-4 group-hover:bg-green-100">
+                    <svg class="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10"/>
+                    </svg>
+                </div>
+                <div>
+                    <h3 class="text-lg font-semibold text-gray-900">Google Takeout Zip</h3>
+                    <p class="text-sm text-gray-500">Import from a downloaded Google Takeout archive</p>
+                </div>
+            </div>
+        </button>
+
+        <div class="w-full bg-white rounded-xl shadow-sm border border-gray-200 p-6 opacity-50">
+            <div class="flex items-center">
+                <div class="w-12 h-12 bg-gray-50 rounded-lg flex items-center justify-center mr-4">
+                    <svg class="w-6 h-6 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"/>
+                    </svg>
+                </div>
+                <div>
+                    <h3 class="text-lg font-semibold text-gray-500">OneDrive / iCloud</h3>
+                    <p class="text-sm text-gray-400">Coming soon</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Step 2a: Scan folder form -->
+    <div id="step-scan" class="hidden">
+        <button onclick="showStep('type')" class="text-blue-600 hover:text-blue-800 text-sm font-medium mb-6 inline-flex items-center">
+            <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+            </svg>
+            Back
+        </button>
+
+        <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-8">
+            <h3 class="text-lg font-semibold text-gray-900 mb-1">Scan a Local Folder</h3>
+            <p class="text-sm text-gray-500 mb-6">Enter the full path to the folder you want to scan.</p>
+
+            <form action="{{ url_for('sources.scan') }}" method="POST">
+                <div class="mb-4">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Folder path</label>
+                    <input type="text" name="folder" required
+                           placeholder="/run/media/tim/Seagate Backup Plus Drive"
+                           class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-sm">
+                </div>
+                <div class="mb-6">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Source label</label>
+                    <input type="text" name="source" value="local"
+                           placeholder="local"
+                           class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-sm">
+                    <p class="text-xs text-gray-400 mt-1">A label to identify where these files came from</p>
+                </div>
+                <button type="submit"
+                        class="w-full px-6 py-3 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition">
+                    Start Scan
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Step 2b: Ingest zip form -->
+    <div id="step-ingest" class="hidden">
+        <button onclick="showStep('type')" class="text-blue-600 hover:text-blue-800 text-sm font-medium mb-6 inline-flex items-center">
+            <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+            </svg>
+            Back
+        </button>
+
+        <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-8">
+            <h3 class="text-lg font-semibold text-gray-900 mb-1">Import Google Takeout</h3>
+            <p class="text-sm text-gray-500 mb-6">Enter the path to your Takeout zip file and where to save unique files.</p>
+
+            <form action="{{ url_for('sources.ingest') }}" method="POST">
+                <div class="mb-4">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Takeout zip file</label>
+                    <input type="text" name="archive" required
+                           placeholder="/home/tim/Downloads/takeout-20260401.zip"
+                           class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500 text-sm">
+                </div>
+                <div class="mb-6">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Destination folder</label>
+                    <input type="text" name="dest" required
+                           placeholder="/run/media/tim/Seagate Backup Plus Drive/cloud_imports"
+                           class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500 text-sm">
+                    <p class="text-xs text-gray-400 mt-1">Unique files will be saved here. Duplicates are skipped automatically.</p>
+                </div>
+                <button type="submit"
+                        class="w-full px-6 py-3 bg-green-600 text-white font-medium rounded-lg hover:bg-green-700 transition">
+                    Start Import
+                </button>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script>
+function showStep(step) {
+    document.getElementById('step-type').classList.add('hidden');
+    document.getElementById('step-scan').classList.add('hidden');
+    document.getElementById('step-ingest').classList.add('hidden');
+    document.getElementById('step-' + step).classList.remove('hidden');
+}
+</script>
+{% endblock %}

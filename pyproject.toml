@@ -12,12 +12,13 @@ dependencies = [
     "libarchive-c",
     "click",
     "piexif",
+    "flask>=3.0",
+    "Pillow>=10.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
-    "Pillow",
 ]
 
 [project.scripts]
