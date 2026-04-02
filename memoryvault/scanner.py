@@ -22,6 +22,10 @@ def scan_folder(folder: Path, db: Database, source: str = "local",
     Returns the number of files scanned.
     """
     folder = folder.resolve()
+
+    if progress_callback:
+        progress_callback("listing", 0, 0)
+
     files = iter_files(folder)
     total = len(files)
 

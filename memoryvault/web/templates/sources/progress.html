@@ -62,67 +62,75 @@
 
 <script>
     const taskId = "{{ task_id }}";
-    let kept = 0, skipped = 0, errors = 0, metadata = 0;
 
-    watchTask(taskId,
-        function onProgress(data) {
-            // Update progress bar
-            if (data.total && data.current !== undefined) {
-                const pct = Math.round((data.current / data.total) * 100);
-                document.getElementById('progress-bar').style.width = pct + '%';
-                document.getElementById('progress-pct').textContent = pct + '%';
-                document.getElementById('progress-count').textContent =
-                    formatNumber(data.current) + ' / ' + formatNumber(data.total) + ' files';
-            }
-
-            // Update status
-            if (data.stage === 'started') {
-                document.getElementById('status-text').textContent = 'Processing...';
-            } else if (data.stage === 'progress') {
-                document.getElementById('status-text').textContent = 'Processing files...';
-                if (data.path) {
-                    document.getElementById('current-file').textContent = data.path;
+    function pollTask() {
+        fetch(`/api/tasks/${taskId}`)
+            .then(r => r.json())
+            .then(data => {
+                if (data.error === 'Task not found') {
+                    document.getElementById('status-text').textContent = 'Task not found.';
+                    return;
                 }
-                if (data.action === 'kept') kept++;
-                else if (data.action === 'skipped') skipped++;
-                else if (data.action === 'errors') errors++;
-            } else if (data.stage === 'done' || data.stage === 'complete') {
-                // Use final stats if available
-                if (data.scanned !== undefined) kept = data.scanned;
-                if (data.kept !== undefined) kept = data.kept;
-                if (data.skipped !== undefined) skipped = data.skipped;
-                if (data.errors !== undefined) errors = data.errors;
-                if (data.merged_metadata !== undefined) metadata = data.merged_metadata;
-            }
 
-            document.getElementById('stat-kept').textContent = formatNumber(kept);
-            document.getElementById('stat-skipped').textContent = formatNumber(skipped);
-            document.getElementById('stat-errors').textContent = formatNumber(errors);
-            document.getElementById('stat-metadata').textContent = formatNumber(metadata);
-        },
-        function onDone(data) {
-            document.getElementById('progress-bar').style.width = '100%';
-            document.getElementById('progress-pct').textContent = '100%';
-            document.getElementById('status-text').textContent = 'Complete!';
-            document.getElementById('current-file').textContent = 'Done';
-            document.getElementById('done-actions').classList.remove('hidden');
+                const p = data.progress || {};
+                const stage = p.stage || data.status;
 
-            // Update final stats
-            if (data.scanned !== undefined) {
-                document.getElementById('stat-kept').textContent = formatNumber(data.scanned);
-            }
-            if (data.kept !== undefined) {
-                document.getElementById('stat-kept').textContent = formatNumber(data.kept);
-                document.getElementById('stat-skipped').textContent = formatNumber(data.skipped || 0);
-                document.getElementById('stat-errors').textContent = formatNumber(data.errors || 0);
-                document.getElementById('stat-metadata').textContent = formatNumber(data.merged_metadata || 0);
-            }
-        },
-        function onError(err) {
-            document.getElementById('status-text').textContent = 'Error: ' + err;
-            document.getElementById('progress-bar').classList.remove('bg-blue-600');
-            document.getElementById('progress-bar').classList.add('bg-red-600');
-        }
-    );
+                // Update status text
+                if (stage === 'listing') {
+                    document.getElementById('status-text').textContent = 'Listing files on disk (this may take a few minutes on large drives)...';
+                    document.getElementById('current-file').textContent = 'Walking directory tree...';
+                } else if (stage === 'start' && p.total) {
+                    document.getElementById('status-text').textContent = 'Found ' + formatNumber(p.total) + ' files. Scanning...';
+                } else if (stage === 'progress' && p.total) {
+                    document.getElementById('status-text').textContent = 'Scanning files...';
+                    const pct = Math.round((p.current / p.total) * 100);
+                    document.getElementById('progress-bar').style.width = pct + '%';
+                    document.getElementById('progress-pct').textContent = pct + '%';
+                    document.getElementById('progress-count').textContent =
+                        formatNumber(p.current) + ' / ' + formatNumber(p.total) + ' files';
+                    document.getElementById('stat-kept').textContent = formatNumber(p.current);
+                } else if (data.status === 'running') {
+                    document.getElementById('status-text').textContent = 'Processing...';
+                }
+
+                // Check if done
+                if (data.status === 'complete') {
+                    document.getElementById('progress-bar').style.width = '100%';
+                    document.getElementById('progress-pct').textContent = '100%';
+                    document.getElementById('status-text').textContent = 'Complete!';
+                    document.getElementById('current-file').textContent = 'Done';
+                    document.getElementById('done-actions').classList.remove('hidden');
+
+                    if (data.result) {
+                        if (data.result.scanned !== undefined) {
+                            document.getElementById('stat-kept').textContent = formatNumber(data.result.scanned);
+                        }
+                        if (data.result.kept !== undefined) {
+                            document.getElementById('stat-kept').textContent = formatNumber(data.result.kept);
+                            document.getElementById('stat-skipped').textContent = formatNumber(data.result.skipped || 0);
+                            document.getElementById('stat-errors').textContent = formatNumber(data.result.errors || 0);
+                            document.getElementById('stat-metadata').textContent = formatNumber(data.result.merged_metadata || 0);
+                        }
+                    }
+                    return; // Stop polling
+                }
+
+                if (data.status === 'error') {
+                    document.getElementById('status-text').textContent = 'Error: ' + (data.error || 'Unknown error');
+                    document.getElementById('progress-bar').classList.remove('bg-blue-600');
+                    document.getElementById('progress-bar').classList.add('bg-red-600');
+                    return; // Stop polling
+                }
+
+                // Keep polling
+                setTimeout(pollTask, 1000);
+            })
+            .catch(err => {
+                // Retry on network error
+                setTimeout(pollTask, 2000);
+            });
+    }
+
+    pollTask();
 </script>
 {% endblock %}

@@ -210,4 +210,4 @@ def serve(ctx, port):
 
     click.echo(f"Starting MemoryVault at http://localhost:{port}")
     webbrowser.open(f"http://localhost:{port}")
-    app.run(host="127.0.0.1", port=port, debug=False)
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
