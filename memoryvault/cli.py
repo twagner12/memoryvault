@@ -10,6 +10,7 @@ from memoryvault.dedup import find_duplicates
 from memoryvault.metadata import (
     get_exif_date, get_exif_gps, write_exif_date, write_exif_gps, can_have_exif,
 )
+from memoryvault.ingest import ingest_archive
 
 
 @click.group()
@@ -135,6 +136,39 @@ def merge(ctx, dry_run):
 
         prefix = "Would merge" if dry_run else "Merged"
         click.echo(f"\n{prefix} {merged_count} metadata fields across {len(results)} duplicate groups.")
+    finally:
+        db.close()
+
+
+@cli.command()
+@click.argument("archive", type=click.Path(exists=True, dir_okay=False, resolve_path=True))
+@click.option("--dest", required=True, type=click.Path(file_okay=False, resolve_path=True),
+              help="Destination folder for unique files.")
+@click.pass_context
+def ingest(ctx, archive, dest):
+    """Ingest a Takeout zip: extract, dedup, and keep unique files."""
+    db = Database(ctx.obj["db_path"])
+
+    def progress(stage, **kwargs):
+        if stage == "already_done":
+            click.echo(f"Archive already processed: {kwargs['archive']}")
+        elif stage == "progress":
+            processed = kwargs["processed"]
+            total = kwargs["total"]
+            action = kwargs["action"]
+            path = Path(kwargs["path"]).name
+            symbol = "+" if action == "kept" else "~" if action == "skipped" else "!"
+            click.echo(f"  [{processed}/{total}] {symbol} {path}")
+        elif stage == "done":
+            s = kwargs["stats"]
+            click.echo(f"\nDone. Kept: {s['kept']}, Skipped: {s['skipped']}, "
+                        f"Errors: {s['errors']}, Metadata merged: {s['merged_metadata']}")
+
+    try:
+        click.echo(f"Ingesting {archive}")
+        click.echo(f"Destination: {dest}")
+        stats = ingest_archive(Path(archive), Path(dest), db, progress_callback=progress)
+        click.echo(f"\nTotal files in database: {db.file_count():,}")
     finally:
         db.close()
 
