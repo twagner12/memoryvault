@@ -59,24 +59,33 @@ def ingest():
         flash(f"Not a file: {archive}", "error")
         return redirect(url_for("sources.wizard"))
 
-    # Check for duplicate zip using fingerprint (first 1MB + file size)
+    # Check for duplicate zip — by fingerprint or by file path
     from memoryvault.web import get_db
     from memoryvault.hasher import hash_bytes
     db = get_db()
-    file_size = archive_path.stat().st_size
-    with open(archive_path, "rb") as f:
-        head = f.read(1_048_576)  # First 1 MB
-    fingerprint = hash_bytes(head + str(file_size).encode())
 
+    # Check by file path first
     existing = db.conn.execute(
-        "SELECT path, title, status, completed_at FROM archives WHERE blake3 = ?",
-        (fingerprint,)
+        "SELECT path, title, status, completed_at FROM archives WHERE path = ? AND status = 'complete'",
+        (str(archive_path.resolve()),)
     ).fetchone()
+
+    # Then check by fingerprint (catches renamed/moved copies)
+    if not existing:
+        file_size = archive_path.stat().st_size
+        with open(archive_path, "rb") as f:
+            head = f.read(1_048_576)
+        fingerprint = hash_bytes(head + str(file_size).encode())
+        existing = db.conn.execute(
+            "SELECT path, title, status, completed_at FROM archives WHERE blake3 = ? AND status = 'complete'",
+            (fingerprint,)
+        ).fetchone()
+
     if existing:
         existing = dict(existing)
         name = existing.get("title") or Path(existing["path"]).name
         when = existing["completed_at"][:16].replace("T", " ") if existing.get("completed_at") else "unknown"
-        flash(f"This file was already processed as \"{name}\" on {when}. Skipping.", "error")
+        flash(f"This file was already processed as \"{name}\" on {when}.", "error")
         return redirect(url_for("sources.wizard"))
 
     task_manager = current_app.config["TASK_MANAGER"]
