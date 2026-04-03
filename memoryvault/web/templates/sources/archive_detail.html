@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% block title %}{{ archive.path | basename }} — MemoryVault{% endblock %}
+
+{% block content %}
+<div class="p-8 max-w-3xl">
+    <a href="{{ url_for('dashboard.index') }}" class="text-blue-600 hover:text-blue-800 text-sm font-medium mb-6 inline-flex items-center">
+        <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+        </svg>
+        Back to Dashboard
+    </a>
+
+    <div class="text-center mb-8 mt-4">
+        <div class="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
+            <svg class="w-8 h-8 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+            </svg>
+        </div>
+        <div class="flex items-center justify-center gap-2">
+            <h2 class="text-2xl font-bold text-gray-900" id="archive-title">{{ archive.title or (archive.path | basename) }}</h2>
+            <button onclick="editTitle()" class="text-gray-400 hover:text-blue-600 transition" title="Edit title">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/>
+                </svg>
+            </button>
+        </div>
+        <div id="title-edit" class="hidden flex items-center justify-center gap-2 mt-2">
+            <input type="text" id="title-input" value="{{ archive.title or '' }}"
+                   placeholder="e.g. Google Photos - myemail@gmail.com"
+                   class="px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 w-80"
+                   onkeydown="if(event.key==='Enter'){saveTitle();event.preventDefault()}">
+            <button onclick="saveTitle()" class="px-3 py-2 text-sm text-white bg-blue-600 rounded-lg hover:bg-blue-700">Save</button>
+            <button onclick="cancelTitle()" class="px-3 py-2 text-sm text-gray-600 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">Cancel</button>
+        </div>
+        {% if archive.completed_at %}
+        <p class="text-sm text-gray-500 mt-1">Completed {{ archive.completed_at[:16] | replace('T', ' ') }} UTC</p>
+        {% endif %}
+    </div>
+
+    <!-- Stats -->
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-8 mb-6">
+        <div class="grid grid-cols-2 gap-6">
+            <div class="text-center p-4">
+                <p class="text-3xl font-bold text-green-600">{{ "{:,}".format(breakdown.get('kept', 0)) }}</p>
+                <p class="text-sm text-gray-500 mt-1">unique files kept</p>
+                {% if kept_size %}
+                <p class="text-xs text-gray-400 mt-1">
+                    {% if kept_size >= 1073741824 %}{{ "%.1f"|format(kept_size / 1073741824) }} GB
+                    {% else %}{{ "%.1f"|format(kept_size / 1048576) }} MB{% endif %}
+                </p>
+                {% endif %}
+            </div>
+            <div class="text-center p-4">
+                <p class="text-3xl font-bold text-yellow-600">{{ "{:,}".format(breakdown.get('duplicate', 0)) }}</p>
+                <p class="text-sm text-gray-500 mt-1">duplicates skipped</p>
+            </div>
+            <div class="text-center p-4">
+                <p class="text-3xl font-bold text-blue-600">{{ "{:,}".format(merge_count) }}</p>
+                <p class="text-sm text-gray-500 mt-1">metadata fields merged</p>
+            </div>
+            <div class="text-center p-4">
+                <p class="text-3xl font-bold text-gray-400">{{ "{:,}".format(breakdown.get('sidecar', 0) + breakdown.get('album_metadata', 0)) }}</p>
+                <p class="text-sm text-gray-500 mt-1">metadata sidecars</p>
+            </div>
+        </div>
+
+        {% if breakdown.get('not_media', 0) > 0 %}
+        <div class="mt-4 pt-4 border-t border-gray-100 text-center">
+            <p class="text-sm text-gray-500">{{ "{:,}".format(breakdown.get('not_media', 0)) }} non-media files skipped (documents, PDFs, etc.)</p>
+        </div>
+        {% endif %}
+
+        {% if breakdown.get('error', 0) > 0 %}
+        <div class="mt-4 pt-4 border-t border-gray-100 text-center">
+            <p class="text-sm text-red-500">{{ "{:,}".format(breakdown.get('error', 0)) }} errors</p>
+        </div>
+        {% endif %}
+
+        <!-- Verification -->
+        {% set total_accounted = (breakdown.get('kept', 0) + breakdown.get('duplicate', 0) + breakdown.get('sidecar', 0) + breakdown.get('album_metadata', 0) + breakdown.get('not_media', 0) + breakdown.get('error', 0)) %}
+        <div class="mt-6 pt-4 border-t border-gray-100">
+            <div class="flex items-center justify-center gap-2">
+                {% if total_accounted == (archive.entries_processed or 0) or archive.entries_processed == 0 %}
+                <svg class="w-5 h-5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                </svg>
+                <p class="text-sm text-green-700">Verified: all {{ "{:,}".format(total_accounted) }} entries accounted for</p>
+                {% else %}
+                <svg class="w-5 h-5 text-yellow-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.732 16.5C2.962 17.333 3.924 19 5.464 19z"/>
+                </svg>
+                <p class="text-sm text-yellow-700">{{ "{:,}".format(total_accounted) }} entries accounted for ({{ "{:,}".format(archive.entries_processed or 0) }} processed)</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Source info -->
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+        <h3 class="text-sm font-semibold text-gray-700 mb-3">Source Details</h3>
+        <div class="space-y-2 text-sm">
+            <div class="flex justify-between">
+                <span class="text-gray-500">File</span>
+                <span class="text-gray-900 font-mono text-xs truncate max-w-md" title="{{ archive.path }}">{{ archive.path }}</span>
+            </div>
+            <div class="flex justify-between">
+                <span class="text-gray-500">Status</span>
+                <span class="text-gray-900">{{ archive.status }}</span>
+            </div>
+            <div class="flex justify-between">
+                <span class="text-gray-500">Total entries</span>
+                <span class="text-gray-900">{{ "{:,}".format(archive.entries_total or total_accounted) }}</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="flex gap-4 mt-8 justify-center">
+        <a href="{{ url_for('sources.wizard') }}"
+           class="px-6 py-3 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition">
+            Add More Photos
+        </a>
+        <a href="{{ url_for('dashboard.index') }}"
+           class="px-6 py-3 bg-white text-gray-700 font-medium rounded-lg border border-gray-300 hover:bg-gray-50 transition">
+            Back to Dashboard
+        </a>
+    </div>
+</div>
+
+<script>
+function editTitle() {
+    document.getElementById('archive-title').parentElement.classList.add('hidden');
+    document.getElementById('title-edit').classList.remove('hidden');
+    document.getElementById('title-input').focus();
+}
+
+function cancelTitle() {
+    document.getElementById('title-edit').classList.add('hidden');
+    document.getElementById('archive-title').parentElement.classList.remove('hidden');
+}
+
+function saveTitle() {
+    const title = document.getElementById('title-input').value.trim();
+    fetch('/api/archives/{{ archive.id }}/title', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({title: title})
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.ok) {
+            document.getElementById('archive-title').textContent = title || '{{ archive.path | basename }}';
+            cancelTitle();
+        } else {
+            alert(data.error || 'Error saving title');
+        }
+    })
+    .catch(err => alert('Error: ' + err));
+}
+</script>
+{% endblock %}

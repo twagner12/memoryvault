@@ -50,7 +50,7 @@ class TaskManager:
         self._executor.submit(self._run_scan, task, folder, db_path, source)
         return task_id
 
-    def submit_ingest(self, archive: str, dest: str, db_path: str) -> str:
+    def submit_ingest(self, archive: str, dest: str, db_path: str, title: str = None) -> str:
         task_id = str(uuid.uuid4())[:8]
         task = TaskInfo(
             id=task_id,
@@ -58,7 +58,7 @@ class TaskManager:
             created_at=datetime.now(timezone.utc).isoformat(),
         )
         self._tasks[task_id] = task
-        self._executor.submit(self._run_ingest, task, archive, dest, db_path)
+        self._executor.submit(self._run_ingest, task, archive, dest, db_path, title)
         return task_id
 
     def get_task(self, task_id: str) -> TaskInfo | None:
@@ -96,7 +96,7 @@ class TaskManager:
             task.status = "error"
             task.add_event({"stage": "error", "error": str(e)})
 
-    def _run_ingest(self, task: TaskInfo, archive: str, dest: str, db_path: str):
+    def _run_ingest(self, task: TaskInfo, archive: str, dest: str, db_path: str, title: str = None):
         import time
         start_time = time.time()
         task.status = "running"
@@ -109,7 +109,7 @@ class TaskManager:
 
         try:
             db = Database(Path(db_path))
-            stats = ingest_archive(Path(archive), Path(dest), db, progress_callback=progress)
+            stats = ingest_archive(Path(archive), Path(dest), db, progress_callback=progress, title=title)
             db.close()
             elapsed = round(time.time() - start_time, 1)
             stats["elapsed"] = elapsed

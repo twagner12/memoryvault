@@ -49,7 +49,7 @@ def _media_name_for_sidecar(sidecar_path: str) -> str | None:
 
 
 def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
-                   progress_callback=None) -> dict:
+                   progress_callback=None, title: str = None) -> dict:
     """Ingest a Takeout zip: stream files, dedup against DB, keep unique files.
 
     Single-pass streaming approach:
@@ -71,11 +71,14 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
     dest_folder.mkdir(parents=True, exist_ok=True)
 
     # Register archive and check for resume
-    # Skip count_entries() — it reads the entire zip and blocks on large files.
-    # We'll update the total as we go.
-    archive_hash = None
-    archive_id = db.register_archive(str(archive_path), blake3=archive_hash,
-                                     entries_total=0)
+    # Fingerprint: hash first 1MB + file size (fast duplicate zip detection)
+    file_size = archive_path.stat().st_size
+    with open(archive_path, "rb") as f:
+        head = f.read(1_048_576)
+    archive_fingerprint = hash_bytes(head + str(file_size).encode())
+
+    archive_id = db.register_archive(str(archive_path), blake3=archive_fingerprint,
+                                     entries_total=0, title=title)
 
     archive_record = db.get_archive(str(archive_path))
     if archive_record["status"] == "complete":
@@ -160,6 +163,27 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
 
     # Mark archive complete
     db.update_archive_status(archive_id, "complete", entries_processed=processed_count)
+
+    # Verification: compute sizes
+    kept_size = 0
+    skipped_dupe_count = 0
+    for row in db.conn.execute(
+        "SELECT status, skip_reason, kept_path FROM archive_entries WHERE archive_id = ?",
+        (archive_id,)
+    ).fetchall():
+        if row["status"] == "kept" and row["kept_path"]:
+            try:
+                kept_size += Path(row["kept_path"]).stat().st_size
+            except OSError:
+                pass
+        if row["skip_reason"] == "duplicate":
+            skipped_dupe_count += 1
+
+    stats["processed_count"] = processed_count
+    stats["kept_size_bytes"] = kept_size
+    stats["skipped_duplicate_count"] = skipped_dupe_count
+    stats["sidecar_count"] = stats["skipped"] - skipped_dupe_count
+    stats["verified"] = (stats["kept"] + stats["skipped"] + stats["errors"] == processed_count)
 
     if progress_callback:
         progress_callback("done", stats=stats)

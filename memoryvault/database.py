@@ -28,10 +28,12 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE TABLE IF NOT EXISTS archives (
     id INTEGER PRIMARY KEY,
     path TEXT NOT NULL,
+    title TEXT,
     blake3 TEXT,
     entries_total INTEGER,
     entries_processed INTEGER DEFAULT 0,
     status TEXT DEFAULT 'pending',
+    completed_at TEXT,
     UNIQUE(path)
 );
 
@@ -82,6 +84,12 @@ class Database:
 
     def _init_schema(self):
         self.conn.executescript(SCHEMA)
+        # Migrations for existing databases
+        for col in ["completed_at TEXT", "title TEXT"]:
+            try:
+                self.conn.execute(f"ALTER TABLE archives ADD COLUMN {col}")
+            except Exception:
+                pass
         self.conn.commit()
 
     def close(self):
@@ -175,12 +183,14 @@ class Database:
 
     # --- Archive operations ---
 
-    def register_archive(self, path: str, blake3: str = None, entries_total: int = 0) -> int:
+    def register_archive(self, path: str, blake3: str = None, entries_total: int = 0,
+                         title: str = None) -> int:
         cursor = self.conn.execute(
-            "INSERT INTO archives (path, blake3, entries_total) VALUES (?, ?, ?) "
-            "ON CONFLICT(path) DO UPDATE SET blake3=excluded.blake3, entries_total=excluded.entries_total "
+            "INSERT INTO archives (path, blake3, entries_total, title) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(path) DO UPDATE SET blake3=excluded.blake3, entries_total=excluded.entries_total, "
+            "title=COALESCE(excluded.title, title) "
             "RETURNING id",
-            (path, blake3, entries_total),
+            (path, blake3, entries_total, title),
         )
         row = cursor.fetchone()
         self.conn.commit()
@@ -191,14 +201,16 @@ class Database:
         return dict(row) if row else None
 
     def update_archive_status(self, archive_id: int, status: str, entries_processed: int = None):
+        completed_at = datetime.now(timezone.utc).isoformat() if status == "complete" else None
         if entries_processed is not None:
             self.conn.execute(
-                "UPDATE archives SET status = ?, entries_processed = ? WHERE id = ?",
-                (status, entries_processed, archive_id),
+                "UPDATE archives SET status = ?, entries_processed = ?, completed_at = COALESCE(?, completed_at) WHERE id = ?",
+                (status, entries_processed, completed_at, archive_id),
             )
         else:
             self.conn.execute(
-                "UPDATE archives SET status = ? WHERE id = ?", (status, archive_id)
+                "UPDATE archives SET status = ?, completed_at = COALESCE(?, completed_at) WHERE id = ?",
+                (status, completed_at, archive_id),
             )
         self.conn.commit()
 

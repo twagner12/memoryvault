@@ -27,20 +27,16 @@
     <!-- Stats cards -->
     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
         <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-            <p class="text-sm font-medium text-gray-500">Files Indexed</p>
+            <p class="text-sm font-medium text-gray-500">Unique Files</p>
             <p class="text-3xl font-bold text-gray-900 mt-2">{{ "{:,}".format(total_files) }}</p>
         </div>
-        <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-            <p class="text-sm font-medium text-gray-500">Duplicate Groups</p>
-            <p class="text-3xl font-bold text-gray-900 mt-2">{{ "{:,}".format(dupe_groups) }}</p>
+        <div class="bg-white rounded-xl shadow-sm border border-green-200 bg-green-50 p-6">
+            <p class="text-sm font-medium text-green-700">Duplicates Avoided</p>
+            <p class="text-3xl font-bold text-green-600 mt-2">{{ "{:,}".format(dupes_avoided) }}</p>
         </div>
-        <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-            <p class="text-sm font-medium text-gray-500">Extra Copies</p>
-            <p class="text-3xl font-bold text-gray-900 mt-2">{{ "{:,}".format(dupe_count) }}</p>
-        </div>
-        <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-            <p class="text-sm font-medium text-gray-500">Wasted Space</p>
-            <p class="text-3xl font-bold text-gray-900 mt-2">{{ "%.1f"|format(wasted_gb) }} GB</p>
+        <div class="bg-white rounded-xl shadow-sm border border-green-200 bg-green-50 p-6">
+            <p class="text-sm font-medium text-green-700">Space Saved</p>
+            <p class="text-3xl font-bold text-green-600 mt-2">{{ "%.1f"|format(space_saved_gb) }} GB</p>
         </div>
     </div>
 
@@ -51,7 +47,7 @@
             <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/>
             </svg>
-            Add Source
+            Add Photos
         </a>
         {% if dupe_groups > 0 %}
         <a href="{{ url_for('battle.index') }}"
@@ -72,19 +68,30 @@
         </div>
         <div class="divide-y divide-gray-100">
             {% for archive in archives %}
-            <div class="px-6 py-4 flex items-center justify-between">
+            <a href="{{ url_for('sources.archive_detail', archive_id=archive.id) }}"
+               class="block px-6 py-4 flex items-center justify-between hover:bg-gray-50 transition cursor-pointer">
                 <div>
-                    <p class="text-sm font-medium text-gray-900">{{ archive.path | basename }}</p>
-                    <p class="text-xs text-gray-500">{{ archive.entries_processed or 0 }} / {{ archive.entries_total or 0 }} entries</p>
+                    <p class="text-sm font-medium text-gray-900">{{ archive.title or (archive.path | basename) }}</p>
+                    <p class="text-xs text-gray-500">{{ "{:,}".format(archive.entries_processed or 0) }} entries processed</p>
                 </div>
-                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium
-                    {% if archive.status == 'complete' %}bg-green-100 text-green-800
-                    {% elif archive.status == 'in_progress' %}bg-blue-100 text-blue-800
-                    {% elif archive.status == 'error' %}bg-red-100 text-red-800
-                    {% else %}bg-gray-100 text-gray-800{% endif %}">
-                    {{ archive.status }}
-                </span>
-            </div>
+                <div class="text-right flex items-center gap-3">
+                    <div>
+                        <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium
+                            {% if archive.status == 'complete' %}bg-green-100 text-green-800
+                            {% elif archive.status == 'in_progress' %}bg-blue-100 text-blue-800
+                            {% elif archive.status == 'error' %}bg-red-100 text-red-800
+                            {% else %}bg-gray-100 text-gray-800{% endif %}">
+                            {{ archive.status }}
+                        </span>
+                        {% if archive.completed_at %}
+                        <p class="text-xs text-gray-400 mt-1">{{ archive.completed_at[:16] | replace('T', ' ') }} UTC</p>
+                        {% endif %}
+                    </div>
+                    <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+                    </svg>
+                </div>
+            </a>
             {% endfor %}
         </div>
     </div>

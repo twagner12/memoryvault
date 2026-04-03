@@ -36,9 +36,15 @@
             <div class="text-center p-4">
                 <p class="text-3xl font-bold text-green-600">{{ "{:,}".format(task.result.get('kept', 0)) }}</p>
                 <p class="text-sm text-gray-500 mt-1">unique files kept</p>
+                {% if task.result.get('kept_size_bytes') %}
+                <p class="text-xs text-gray-400 mt-1">
+                    {% set kb = task.result.kept_size_bytes / 1048576 %}
+                    {% if kb >= 1024 %}{{ "%.1f"|format(kb / 1024) }} GB{% else %}{{ "%.1f"|format(kb) }} MB{% endif %}
+                </p>
+                {% endif %}
             </div>
             <div class="text-center p-4">
-                <p class="text-3xl font-bold text-yellow-600">{{ "{:,}".format(task.result.get('skipped', 0)) }}</p>
+                <p class="text-3xl font-bold text-yellow-600">{{ "{:,}".format(task.result.get('skipped_duplicate_count', task.result.get('skipped', 0))) }}</p>
                 <p class="text-sm text-gray-500 mt-1">duplicates skipped</p>
             </div>
             <div class="text-center p-4">
@@ -46,8 +52,28 @@
                 <p class="text-sm text-gray-500 mt-1">metadata fields merged</p>
             </div>
             <div class="text-center p-4">
-                <p class="text-3xl font-bold text-red-600">{{ "{:,}".format(task.result.get('errors', 0)) }}</p>
-                <p class="text-sm text-gray-500 mt-1">errors</p>
+                <p class="text-3xl font-bold text-gray-400">{{ "{:,}".format(task.result.get('sidecar_count', 0)) }}</p>
+                <p class="text-sm text-gray-500 mt-1">metadata sidecars</p>
+            </div>
+        </div>
+
+        <!-- Verification -->
+        {% set r = task.result %}
+        {% set total_accounted = r.get('kept', 0) + r.get('skipped', 0) + r.get('errors', 0) %}
+        {% set total_processed = r.get('processed_count', 0) %}
+        <div class="mt-6 pt-4 border-t border-gray-100">
+            <div class="flex items-center justify-center gap-2">
+                {% if r.get('verified', False) %}
+                <svg class="w-5 h-5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                </svg>
+                <p class="text-sm text-green-700">Verified: all {{ "{:,}".format(total_processed) }} entries accounted for ({{ "{:,}".format(r.get('kept', 0)) }} kept + {{ "{:,}".format(r.get('skipped_duplicate_count', 0)) }} duplicates + {{ "{:,}".format(r.get('sidecar_count', 0)) }} sidecars + {{ "{:,}".format(r.get('errors', 0)) }} errors)</p>
+                {% else %}
+                <svg class="w-5 h-5 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L3.732 16.5C2.962 17.333 3.924 19 5.464 19z"/>
+                </svg>
+                <p class="text-sm text-red-700">Warning: processed {{ "{:,}".format(total_processed) }} entries but only accounted for {{ "{:,}".format(total_accounted) }}</p>
+                {% endif %}
             </div>
         </div>
         {% endif %}
@@ -72,7 +98,7 @@
     <div class="flex gap-4 mt-8 justify-center">
         <a href="{{ url_for('sources.wizard') }}"
            class="px-6 py-3 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition">
-            Add Another Source
+            Add More Photos
         </a>
         <a href="{{ url_for('dashboard.index') }}"
            class="px-6 py-3 bg-white text-gray-700 font-medium rounded-lg border border-gray-300 hover:bg-gray-50 transition">

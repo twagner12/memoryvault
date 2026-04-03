@@ -1,10 +1,10 @@
 {% extends "base.html" %}
-{% block title %}Add Source — MemoryVault{% endblock %}
+{% block title %}Add Photos — MemoryVault{% endblock %}
 
 {% block content %}
 <div class="p-8 max-w-3xl">
-    <h2 class="text-2xl font-bold text-gray-900 mb-2">Add a Source</h2>
-    <p class="text-gray-500 mb-8">Choose where your files are coming from.</p>
+    <h2 class="text-2xl font-bold text-gray-900 mb-2">Add Photos</h2>
+    <p class="text-gray-500 mb-8">Choose where your photos are coming from.</p>
 
     <!-- Step 1: Choose source type -->
     <div id="step-type" class="space-y-4">
@@ -111,6 +111,13 @@
             <p class="text-sm text-gray-500 mb-6">Select your Takeout zip file and where to save unique files.</p>
 
             <form action="{{ url_for('sources.ingest') }}" method="POST">
+                <div class="mb-4">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Source name</label>
+                    <input type="text" name="title"
+                           placeholder="e.g. Google Drive - twags012@gmail.com"
+                           class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500 text-sm">
+                    <p class="text-xs text-gray-400 mt-1">A friendly name to identify this source on the dashboard</p>
+                </div>
                 <div class="mb-4">
                     <label class="block text-sm font-medium text-gray-700 mb-2">Takeout zip file</label>
                     <div class="flex gap-2">

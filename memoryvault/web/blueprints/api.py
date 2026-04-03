@@ -124,6 +124,22 @@ def browse():
     })
 
 
+@bp.route("/archives/<int:archive_id>/title", methods=["POST"])
+def update_archive_title(archive_id):
+    """Update an archive's title."""
+    db = get_db()
+    data = request.get_json()
+    title = data.get("title", "").strip()
+
+    row = db.conn.execute("SELECT id FROM archives WHERE id = ?", (archive_id,)).fetchone()
+    if not row:
+        return jsonify({"error": "Archive not found"}), 404
+
+    db.conn.execute("UPDATE archives SET title = ? WHERE id = ?", (title or None, archive_id))
+    db.conn.commit()
+    return jsonify({"ok": True, "title": title})
+
+
 @bp.route("/mkdir", methods=["POST"])
 def mkdir():
     """Create a new folder."""

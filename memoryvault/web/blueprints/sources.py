@@ -42,6 +42,7 @@ def scan():
 def ingest():
     archive = request.form.get("archive", "").strip()
     dest = request.form.get("dest", "").strip()
+    title = request.form.get("title", "").strip() or None
 
     if not archive:
         flash("Please enter a zip file path.", "error")
@@ -58,9 +59,29 @@ def ingest():
         flash(f"Not a file: {archive}", "error")
         return redirect(url_for("sources.wizard"))
 
+    # Check for duplicate zip using fingerprint (first 1MB + file size)
+    from memoryvault.web import get_db
+    from memoryvault.hasher import hash_bytes
+    db = get_db()
+    file_size = archive_path.stat().st_size
+    with open(archive_path, "rb") as f:
+        head = f.read(1_048_576)  # First 1 MB
+    fingerprint = hash_bytes(head + str(file_size).encode())
+
+    existing = db.conn.execute(
+        "SELECT path, title, status, completed_at FROM archives WHERE blake3 = ?",
+        (fingerprint,)
+    ).fetchone()
+    if existing:
+        existing = dict(existing)
+        name = existing.get("title") or Path(existing["path"]).name
+        when = existing["completed_at"][:16].replace("T", " ") if existing.get("completed_at") else "unknown"
+        flash(f"This file was already processed as \"{name}\" on {when}. Skipping.", "error")
+        return redirect(url_for("sources.wizard"))
+
     task_manager = current_app.config["TASK_MANAGER"]
     db_path = str(current_app.config["DB_PATH"])
-    task_id = task_manager.submit_ingest(archive, dest, db_path)
+    task_id = task_manager.submit_ingest(archive, dest, db_path, title=title)
 
     return redirect(url_for("sources.progress", task_id=task_id))
 
@@ -85,3 +106,48 @@ def summary(task_id):
         return redirect(url_for("dashboard.index"))
 
     return render_template("sources/summary.html", task=task)
+
+
+@bp.route("/archive/<int:archive_id>")
+def archive_detail(archive_id):
+    from memoryvault.web import get_db
+    db = get_db()
+
+    archive = db.conn.execute("SELECT * FROM archives WHERE id = ?", (archive_id,)).fetchone()
+    if not archive:
+        flash("Archive not found.", "error")
+        return redirect(url_for("dashboard.index"))
+
+    archive = dict(archive)
+
+    # Get entry breakdown
+    breakdown = db.conn.execute("""
+        SELECT
+            COALESCE(skip_reason, status) as reason,
+            COUNT(*) as count
+        FROM archive_entries
+        WHERE archive_id = ?
+        GROUP BY reason
+    """, (archive_id,)).fetchall()
+    breakdown = {r["reason"]: r["count"] for r in breakdown}
+
+    # Get kept files total size
+    kept_size = db.conn.execute("""
+        SELECT COALESCE(SUM(f.size), 0) as total
+        FROM archive_entries ae
+        JOIN files f ON f.path = ae.kept_path
+        WHERE ae.archive_id = ? AND ae.status = 'kept'
+    """, (archive_id,)).fetchone()["total"]
+
+    # Get metadata merge count
+    merge_count = db.conn.execute("""
+        SELECT COUNT(*) as cnt FROM metadata_log
+        WHERE source_desc LIKE 'takeout:%'
+        AND target_path IN (SELECT kept_path FROM archive_entries WHERE archive_id = ?)
+    """, (archive_id,)).fetchone()["cnt"]
+
+    return render_template("sources/archive_detail.html",
+                           archive=archive,
+                           breakdown=breakdown,
+                           kept_size=kept_size,
+                           merge_count=merge_count)
