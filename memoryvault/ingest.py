@@ -276,7 +276,7 @@ def _process_media_entry_inner(entry: ArchiveEntry, dest_folder: Path, db: Datab
     # Check if we already have this exact file
     existing = db.get_files_by_full_hash(full_hash)
     if existing:
-        merged = _try_merge_sidecar_to_existing(entry.path, existing[0], sidecars, db)
+        merged = _try_merge_from_duplicate(entry, existing[0], sidecars, db)
         db.log_archive_entry(archive_id, entry.path, "skipped", skip_reason="duplicate")
         return {"action": "skipped", "merged": merged}
 
@@ -292,8 +292,8 @@ def _process_media_entry_inner(entry: ArchiveEntry, dest_folder: Path, db: Datab
         for existing_file in same_size:
             if existing_file.get("blake3_head") == head_hash:
                 if existing_file.get("blake3_full") == full_hash:
-                    merged = _try_merge_sidecar_to_existing(
-                        entry.path, existing_file, sidecars, db)
+                    merged = _try_merge_from_duplicate(
+                        entry, existing_file, sidecars, db)
                     db.log_archive_entry(archive_id, entry.path, "skipped",
                                          skip_reason="duplicate")
                     return {"action": "skipped", "merged": merged}
@@ -357,35 +357,63 @@ def _process_media_entry_inner(entry: ArchiveEntry, dest_folder: Path, db: Datab
     return {"action": "kept", "merged": merged, "dest_path": str(dest_path)}
 
 
-def _try_merge_sidecar_to_existing(entry_path: str, existing: dict,
-                                    sidecars: dict, db: Database) -> list[str]:
-    """Try to merge sidecar metadata into an existing file that was kept."""
+def _try_merge_from_duplicate(entry: ArchiveEntry, existing: dict,
+                              sidecars: dict, db: Database) -> list[str]:
+    """Try to merge metadata from a skipped duplicate into the kept file.
+
+    Checks two sources:
+    1. The Takeout JSON sidecar (if available)
+    2. The duplicate file's own EXIF data (file-to-file merge)
+    """
+    from memoryvault.metadata import merge_metadata_from_file
+    import tempfile
+
     merged = []
-    sidecar = sidecars.get(entry_path)
-    if not sidecar:
-        return merged
-
     existing_path = Path(existing["path"])
-    if not existing_path.exists() or not can_have_exif(existing_path):
+    if not existing_path.exists():
         return merged
 
-    if sidecar.get("date") and not existing.get("has_exif_date"):
-        try:
-            write_exif_date(existing_path, sidecar["date"])
-            db.log_metadata_merge(str(existing_path), f"takeout:{entry_path}", "date",
-                                  sidecar["date"])
-            merged.append("date")
-        except Exception:
-            pass
+    # First: try sidecar metadata
+    sidecar = sidecars.get(entry.path)
+    if sidecar and can_have_exif(existing_path):
+        if sidecar.get("date") and not existing.get("has_exif_date"):
+            try:
+                write_exif_date(existing_path, sidecar["date"])
+                db.log_metadata_merge(str(existing_path), f"takeout:{entry.path}", "date",
+                                      sidecar["date"])
+                merged.append("date")
+            except Exception:
+                pass
 
-    if sidecar.get("lat") is not None and not existing.get("has_exif_gps"):
-        try:
-            write_exif_gps(existing_path, sidecar["lat"], sidecar["lon"])
-            db.log_metadata_merge(str(existing_path), f"takeout:{entry_path}", "gps",
-                                  f"{sidecar['lat']},{sidecar['lon']}")
-            merged.append("gps")
-        except Exception:
-            pass
+        if sidecar.get("lat") is not None and not existing.get("has_exif_gps"):
+            try:
+                write_exif_gps(existing_path, sidecar["lat"], sidecar["lon"])
+                db.log_metadata_merge(str(existing_path), f"takeout:{entry.path}", "gps",
+                                      f"{sidecar['lat']},{sidecar['lon']}")
+                merged.append("gps")
+            except Exception:
+                pass
+
+    # Second: try file-to-file merge (duplicate may have EXIF the kept file lacks)
+    if can_have_exif(existing_path) and ("date" not in merged or "gps" not in merged):
+        # Need to write the duplicate to a temp file to read its EXIF
+        if entry.is_large and entry.temp_path:
+            source_path = entry.temp_path
+            file_merged = merge_metadata_from_file(existing_path, source_path, db=db)
+            merged.extend(file_merged)
+        elif entry.data:
+            suffix = Path(entry.path).suffix
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(entry.data)
+                tmp_path = Path(tmp.name)
+            try:
+                file_merged = merge_metadata_from_file(existing_path, tmp_path, db=db)
+                merged.extend(file_merged)
+            finally:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
 
     return merged
 

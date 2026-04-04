@@ -240,3 +240,49 @@ def merge_metadata_from_sidecar(media_path: Path, sidecar_path: Path) -> list[st
         merged.append("gps")
 
     return merged
+
+
+def merge_metadata_from_file(target: Path, source: Path, db=None) -> list[str]:
+    """Merge metadata from a source file into a target file.
+
+    If the target is missing date or GPS but the source has it,
+    copy it over. This handles the case where a duplicate has better
+    metadata than the original that was kept.
+
+    Returns a list of fields that were merged.
+    """
+    if not can_have_exif(target) or not can_have_exif(source):
+        return []
+    if not target.exists() or not source.exists():
+        return []
+
+    merged = []
+
+    # Merge date if target doesn't have one but source does
+    target_date = get_exif_date(target)
+    if not target_date:
+        source_date = get_exif_date(source)
+        if source_date:
+            try:
+                write_exif_date(target, source_date)
+                merged.append("date")
+                if db:
+                    db.log_metadata_merge(str(target), str(source), "date", source_date)
+            except Exception:
+                pass
+
+    # Merge GPS if target doesn't have it but source does
+    target_gps = get_exif_gps(target)
+    if not target_gps:
+        source_gps = get_exif_gps(source)
+        if source_gps:
+            try:
+                write_exif_gps(target, source_gps[0], source_gps[1])
+                merged.append("gps")
+                if db:
+                    db.log_metadata_merge(str(target), str(source), "gps",
+                                          f"{source_gps[0]},{source_gps[1]}")
+            except Exception:
+                pass
+
+    return merged
