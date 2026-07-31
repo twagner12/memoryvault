@@ -6,5 +6,10 @@ build/
 .venv/
 venv/
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.sqlite
 .env
+.thumbnails/
+.pytest_cache/
