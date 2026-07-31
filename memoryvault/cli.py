@@ -7,10 +7,8 @@ import click
 from memoryvault.database import Database, mark_auto_resolutions_stale
 from memoryvault.scanner import scan_folder
 from memoryvault.dedup import find_duplicates
-from memoryvault.metadata import (
-    get_exif_date, get_exif_gps, write_exif_date, write_exif_gps, can_have_exif,
-)
-from memoryvault.ingest import ingest_archive
+from memoryvault.metadata import get_exif_date, get_exif_gps, can_have_exif
+from memoryvault.ingest import ingest_archive, merge_metadata_between_files
 from memoryvault.volumes import UnreachableVolumeError, find_unreachable_volumes
 
 
@@ -95,48 +93,44 @@ def merge(ctx, dry_run):
             return
 
         merged_count = 0
+        failed_count = 0
         for group in results:
             winner_path = Path(group["winner"]["path"])
-            if not can_have_exif(winner_path) or not winner_path.exists():
+            if not winner_path.exists() or not can_have_exif(winner_path):
                 continue
-
-            winner_date = get_exif_date(winner_path)
-            winner_gps = get_exif_gps(winner_path)
 
             for loser in group["losers"]:
                 loser_path = Path(loser["path"])
-                if not can_have_exif(loser_path) or not loser_path.exists():
+                if not loser_path.exists() or not can_have_exif(loser_path):
                     continue
 
-                # Try to get date from loser if winner doesn't have it
-                if not winner_date:
-                    loser_date = get_exif_date(loser_path)
-                    if loser_date:
-                        if dry_run:
-                            click.echo(f"  Would merge date {loser_date} from {loser_path} → {winner_path}")
-                        else:
-                            write_exif_date(winner_path, loser_date)
-                            db.log_metadata_merge(str(winner_path), str(loser_path), "date", loser_date)
-                            click.echo(f"  Merged date {loser_date} → {winner_path.name}")
-                        winner_date = loser_date
-                        merged_count += 1
+                if get_exif_date(winner_path) and get_exif_gps(winner_path):
+                    break  # nothing left for this winner to gain
 
-                # Try to get GPS from loser if winner doesn't have it
-                if not winner_gps:
-                    loser_gps = get_exif_gps(loser_path)
-                    if loser_gps:
-                        if dry_run:
-                            click.echo(f"  Would merge GPS {loser_gps} from {loser_path} → {winner_path}")
-                        else:
-                            write_exif_gps(winner_path, loser_gps[0], loser_gps[1])
-                            db.log_metadata_merge(str(winner_path), str(loser_path), "gps",
-                                                  f"{loser_gps[0]},{loser_gps[1]}")
-                            click.echo(f"  Merged GPS {loser_gps} → {winner_path.name}")
-                        winner_gps = loser_gps
-                        merged_count += 1
+                if dry_run:
+                    for field, value in (("date", get_exif_date(loser_path)),
+                                         ("gps", get_exif_gps(loser_path))):
+                        if value:
+                            click.echo(f"  Would merge {field} {value} from "
+                                       f"{loser_path} → {winner_path}")
+                    continue
+
+                # Routed through the ingest choke point so a failed write is
+                # recorded in metadata_pending instead of vanishing.
+                outcome = merge_metadata_between_files(winner_path, loser_path, db)
+                for field in outcome.merged:
+                    click.echo(f"  Merged {field} → {winner_path.name}")
+                for field in outcome.failed:
+                    click.echo(f"  FAILED {field} → {winner_path.name} "
+                               f"(recorded as pending)", err=True)
+                merged_count += len(outcome.merged)
+                failed_count += len(outcome.failed)
 
         prefix = "Would merge" if dry_run else "Merged"
         click.echo(f"\n{prefix} {merged_count} metadata fields across {len(results)} duplicate groups.")
+        if failed_count:
+            click.echo(f"{failed_count} write(s) failed and were recorded — "
+                       f"see `memoryvault pending`.")
     finally:
         db.close()
 
@@ -197,6 +191,86 @@ def stats(ctx):
         click.echo(f"Duplicate groups:  {len(dupes):,}")
         click.echo(f"Extra copies:      {dupe_files:,}")
         click.echo(f"Wasted space:      {wasted / (1024**3):.1f} GB")
+
+        pending = db.get_pending_summary()
+        unmatched = db.get_unmatched_summary()
+        outstanding = sum(p["count"] for p in pending)
+        unbound = sum(u["count"] for u in unmatched)
+
+        click.echo(f"Metadata pending:  {outstanding:,}"
+                   + ("   (memoryvault pending)" if outstanding else ""))
+        click.echo(f"Sidecars unmatched:{unbound:,}"
+                   + ("   (memoryvault unmatched)" if unbound else ""))
+    finally:
+        db.close()
+
+
+@cli.command()
+@click.option("--limit", default=20, help="Max rows to list (0 = summary only).")
+@click.pass_context
+def pending(ctx, limit):
+    """List metadata that could not be embedded, and why.
+
+    These are the outcomes that used to disappear: a date destined for a HEIC
+    or a video, or a write that failed. Each row carries enough to be applied
+    later without the original sidecar.
+    """
+    db = Database(ctx.obj["db_path"])
+    try:
+        summary = db.get_pending_summary()
+        if not summary:
+            click.echo("No outstanding metadata.")
+            return
+
+        total = sum(row["count"] for row in summary)
+        click.echo(f"{total:,} outstanding metadata value(s):\n")
+        for row in summary:
+            click.echo(f"  {row['count']:>7,}  {row['state']:<9} "
+                       f"{row['field']:<5} {row['reason']}")
+
+        if limit:
+            rows = db.get_pending()[:limit]
+            click.echo(f"\nFirst {len(rows)} of {total:,}:")
+            for row in rows:
+                click.echo(f"  {row['state']:<9} {row['field']:<5} "
+                           f"{Path(row['file_path']).name}")
+                click.echo(f"      reason: {row['reason']}")
+                click.echo(f"      value:  {row['value']}")
+    finally:
+        db.close()
+
+
+@cli.command()
+@click.option("--limit", default=20, help="Max rows to list (0 = summary only).")
+@click.pass_context
+def unmatched(ctx, limit):
+    """List sidecars whose media file could not be identified.
+
+    Takeout exposes no hashes and often strips EXIF, so the sidecar is
+    frequently the only record of when and where a photo was taken. These
+    rows keep the parsed payload, so a rebind pass needs neither the zip nor
+    the JSON file — both of which are gone after ingest.
+    """
+    db = Database(ctx.obj["db_path"])
+    try:
+        summary = db.get_unmatched_summary()
+        if not summary:
+            click.echo("No unmatched sidecars.")
+            return
+
+        total = sum(row["count"] for row in summary)
+        click.echo(f"{total:,} unmatched sidecar(s):\n")
+        for row in summary:
+            click.echo(f"  {row['count']:>7,}  {row['reason']}")
+
+        if limit:
+            rows = db.get_unmatched()[:limit]
+            click.echo(f"\nFirst {len(rows)} of {total:,}:")
+            for row in rows:
+                click.echo(f"  {row['reason']:<16} {row['entry_name']}")
+                click.echo(f"      sought: {row['media_stem']}"
+                           + (f"  counter={row['counter']}" if row["counter"] else "")
+                           + f"  in {row['archive_dir']}")
     finally:
         db.close()
 

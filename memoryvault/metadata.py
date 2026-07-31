@@ -1,29 +1,82 @@
-"""Read/write EXIF date and GPS metadata, and parse Google Takeout JSON sidecars."""
+"""Read/write EXIF date and GPS metadata, and parse Google Takeout JSON sidecars.
+
+Two rules hold throughout this module, both from findings #7 and #10:
+
+- Capability is decided by the file's *bytes*, never its extension. See
+  `memoryvault.containers`.
+- A write that cannot be performed correctly raises. It never falls back to
+  substituting an empty EXIF dict, because that silently deletes the metadata
+  the write was called to preserve.
+"""
 
 import json
-import struct
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 import piexif
 
+from memoryvault.containers import detect_container, supports_exif
 
-# EXIF-capable image extensions
-EXIF_EXTENSIONS = {".jpg", ".jpeg", ".tiff", ".tif", ".heic", ".heif", ".webp"}
+# Extensions that *hint* at an EXIF-capable file. Kept only for cheap
+# pre-filtering where no bytes are available; `can_have_exif` is the
+# authority. `.heic/.heif/.tiff/.tif` were removed here as part of #7 —
+# piexif cannot write any of them, and pretending otherwise produced 17,164
+# HEIC files whose writes were verified no-ops.
+EXIF_EXTENSIONS = {".jpg", ".jpeg", ".webp"}
+
+
+class UnparseableExifError(Exception):
+    """The file has an EXIF segment that piexif cannot parse.
+
+    Raised instead of silently replacing it with an empty one. Malformed
+    maker notes are common, and the old fallback turned "I cannot read this"
+    into "I have deleted this."
+    """
 
 
 def can_have_exif(path: Path) -> bool:
-    return path.suffix.lower() in EXIF_EXTENSIONS
+    """True when EXIF can actually be embedded into this file's container.
+
+    Reads the file's magic bytes. An unreadable or missing file answers
+    False — there is genuinely nowhere to write — but the caller is expected
+    to have established existence for anything it intends to modify.
+    """
+    try:
+        return supports_exif(detect_container(path))
+    except OSError:
+        return False
 
 
 def read_exif(path: Path) -> dict | None:
-    """Read EXIF data from an image file. Returns None if not readable."""
+    """Read EXIF data from an image file. Returns None if not readable.
+
+    This is the *read* path, where a missing or unparseable segment is a
+    legitimate answer of "no metadata". Writes use `_load_exif_for_write`,
+    which distinguishes the two.
+    """
     if not can_have_exif(path):
         return None
     try:
         return piexif.load(str(path))
     except Exception:
         return None
+
+
+def _load_exif_for_write(path: Path) -> dict:
+    """Load EXIF ahead of modifying it, refusing to guess on failure.
+
+    A file with no EXIF at all loads as empty IFDs and is safe to write. A
+    file whose EXIF exists but cannot be parsed raises: overwriting it would
+    discard tags we were never able to see.
+    """
+    if not can_have_exif(path):
+        raise UnparseableExifError(
+            f"{path.name}: {detect_container(path).value} cannot carry EXIF"
+        )
+    try:
+        return piexif.load(str(path))
+    except Exception as exc:
+        raise UnparseableExifError(f"{path.name}: {exc}") from exc
 
 
 def get_exif_date(path: Path) -> str | None:
@@ -52,7 +105,9 @@ def get_exif_date(path: Path) -> str | None:
             dt = datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
             return dt.isoformat()
         except (ValueError, UnicodeDecodeError):
-            pass
+            # A malformed DateTime is the same answer as no DateTime: this
+            # file cannot tell us when it was taken.
+            return None
 
     return None
 
@@ -108,41 +163,84 @@ def get_exif_gps(path: Path) -> tuple[float, float] | None:
         return None
 
 
-def write_exif_date(path: Path, date_iso: str):
-    """Write a date into the EXIF DateTimeOriginal field."""
-    dt = datetime.fromisoformat(date_iso)
-    date_str = dt.strftime("%Y:%m:%d %H:%M:%S").encode("utf-8")
+def get_exif_offset(path: Path) -> str | None:
+    """Read OffsetTimeOriginal — the zone EXIF's wall clock is relative to."""
+    exif = read_exif(path)
+    if not exif:
+        return None
 
-    try:
-        exif = piexif.load(str(path))
-    except Exception:
-        exif = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
+    for tag in (piexif.ExifIFD.OffsetTimeOriginal,
+                piexif.ExifIFD.OffsetTimeDigitized):
+        val = exif.get("Exif", {}).get(tag)
+        if val:
+            try:
+                return val.decode("ascii") if isinstance(val, bytes) else val
+            except UnicodeDecodeError:
+                continue
+    return None
+
+
+def write_exif_date(path: Path, local_dt: datetime, offset: str | None = None):
+    """Write a local wall-clock capture time, plus the zone it belongs to.
+
+    `local_dt` must be naive. EXIF DateTimeOriginal carries no zone, so an
+    aware datetime would be silently rendered in whatever zone it happened to
+    hold — the ±14 h error of finding #9. The zone is written separately as
+    OffsetTimeOriginal, where it is unambiguous and recoverable.
+
+    Raises UnparseableExifError rather than overwriting EXIF it cannot read.
+    """
+    if local_dt.tzinfo is not None:
+        raise ValueError(
+            "write_exif_date requires a naive local datetime; "
+            "pass the wall clock and give the zone via `offset`"
+        )
+
+    date_str = local_dt.strftime("%Y:%m:%d %H:%M:%S").encode("utf-8")
+    exif = _load_exif_for_write(path)
 
     exif.setdefault("Exif", {})[piexif.ExifIFD.DateTimeOriginal] = date_str
+    exif.setdefault("Exif", {})[piexif.ExifIFD.DateTimeDigitized] = date_str
     exif.setdefault("0th", {})[piexif.ImageIFD.DateTime] = date_str
 
-    exif_bytes = piexif.dump(exif)
-    piexif.insert(exif_bytes, str(path))
+    if offset:
+        encoded = offset.encode("ascii")
+        exif["Exif"][piexif.ExifIFD.OffsetTimeOriginal] = encoded
+        exif["Exif"][piexif.ExifIFD.OffsetTimeDigitized] = encoded
+
+    _insert(exif, path)
 
 
 def write_exif_gps(path: Path, lat: float, lon: float):
-    """Write GPS coordinates into EXIF."""
-    try:
-        exif = piexif.load(str(path))
-    except Exception:
-        exif = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
+    """Merge GPS coordinates into EXIF, preserving the rest of the GPS IFD.
+
+    Only the four lat/lon keys are touched. The previous implementation
+    assigned `exif["GPS"] = gps_ifd`, which discarded GPSAltitude,
+    GPSTimeStamp, GPSDateStamp and GPSImgDirection on every merge (#10).
+
+    Raises UnparseableExifError rather than overwriting EXIF it cannot read.
+    """
+    exif = _load_exif_for_write(path)
 
     lat_dms, lat_neg = _decimal_to_dms(lat)
     lon_dms, lon_neg = _decimal_to_dms(lon)
 
-    gps_ifd = {
-        piexif.GPSIFD.GPSLatitudeRef: b"S" if lat_neg else b"N",
-        piexif.GPSIFD.GPSLatitude: lat_dms,
-        piexif.GPSIFD.GPSLongitudeRef: b"W" if lon_neg else b"E",
-        piexif.GPSIFD.GPSLongitude: lon_dms,
-    }
-    exif["GPS"] = gps_ifd
+    gps = exif.setdefault("GPS", {})
+    gps[piexif.GPSIFD.GPSLatitudeRef] = b"S" if lat_neg else b"N"
+    gps[piexif.GPSIFD.GPSLatitude] = lat_dms
+    gps[piexif.GPSIFD.GPSLongitudeRef] = b"W" if lon_neg else b"E"
+    gps[piexif.GPSIFD.GPSLongitude] = lon_dms
 
+    _insert(exif, path)
+
+
+def _insert(exif: dict, path: Path):
+    """Serialise and embed, leaving the file untouched if either step fails.
+
+    `piexif.dump` can reject an IFD that loaded cleanly — an out-of-range
+    value, or a tag whose type it will not re-encode. Doing the dump before
+    opening the file for write keeps a failure from truncating the original.
+    """
     exif_bytes = piexif.dump(exif)
     piexif.insert(exif_bytes, str(path))
 
@@ -174,41 +272,33 @@ def find_takeout_sidecar(media_path: Path) -> Path | None:
     return None
 
 
-def parse_takeout_sidecar(json_path: Path) -> dict:
-    """Parse a Google Takeout JSON sidecar and extract date and GPS.
+def parse_sidecar_json(data: dict) -> dict:
+    """Extract the raw UTC epoch and GPS from decoded sidecar JSON.
 
-    Returns dict with keys:
-      - date: ISO format string or None
-      - lat: float or None
-      - lon: float or None
+    The timestamp stays an epoch. Takeout records UTC; EXIF wants camera-local
+    wall-clock time, and converting here — with no location in hand — is what
+    produced the ±14 h drift of finding #9. `memoryvault.phototime` does the
+    conversion later, when the file and its siblings are available.
     """
-    try:
-        data = json.loads(json_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return {"date": None, "lat": None, "lon": None}
+    result = {"utc_epoch": None, "lat": None, "lon": None}
 
-    result = {"date": None, "lat": None, "lon": None}
-
-    # Date: photoTakenTime or creationTime
     for time_key in ("photoTakenTime", "creationTime"):
         time_data = data.get(time_key)
         if time_data and "timestamp" in time_data:
             try:
                 ts = int(time_data["timestamp"])
-                if ts > 0:
-                    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                    result["date"] = dt.isoformat()
-                    break
-            except (ValueError, OSError):
+            except (TypeError, ValueError):
                 continue
+            if ts > 0:
+                result["utc_epoch"] = ts
+                break
 
-    # GPS: geoData or geoDataExif
     for geo_key in ("geoData", "geoDataExif"):
         geo = data.get(geo_key)
         if geo:
             lat = geo.get("latitude", 0)
             lon = geo.get("longitude", 0)
-            # Google uses 0,0 as "no data"
+            # Google writes 0,0 to mean "no data".
             if lat != 0 or lon != 0:
                 result["lat"] = lat
                 result["lon"] = lon
@@ -217,72 +307,24 @@ def parse_takeout_sidecar(json_path: Path) -> dict:
     return result
 
 
-def merge_metadata_from_sidecar(media_path: Path, sidecar_path: Path) -> list[str]:
-    """Merge metadata from a Takeout sidecar into the media file's EXIF.
+def parse_takeout_sidecar(json_path: Path) -> dict:
+    """Parse a Google Takeout JSON sidecar from disk.
 
-    Only writes fields that are missing from the file's EXIF.
-    Returns a list of fields that were merged.
+    Returns dict with keys `utc_epoch`, `lat` and `lon`. An unreadable file
+    yields all-None — the caller records that as an unmatched sidecar rather
+    than treating it as absence of metadata.
     """
-    if not can_have_exif(media_path):
-        return []
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return {"utc_epoch": None, "lat": None, "lon": None}
 
-    sidecar = parse_takeout_sidecar(sidecar_path)
-    merged = []
-
-    # Merge date if file doesn't have one
-    if sidecar["date"] and not get_exif_date(media_path):
-        write_exif_date(media_path, sidecar["date"])
-        merged.append("date")
-
-    # Merge GPS if file doesn't have it
-    if sidecar["lat"] is not None and not get_exif_gps(media_path):
-        write_exif_gps(media_path, sidecar["lat"], sidecar["lon"])
-        merged.append("gps")
-
-    return merged
+    return parse_sidecar_json(data)
 
 
-def merge_metadata_from_file(target: Path, source: Path, db=None) -> list[str]:
-    """Merge metadata from a source file into a target file.
-
-    If the target is missing date or GPS but the source has it,
-    copy it over. This handles the case where a duplicate has better
-    metadata than the original that was kept.
-
-    Returns a list of fields that were merged.
-    """
-    if not can_have_exif(target) or not can_have_exif(source):
-        return []
-    if not target.exists() or not source.exists():
-        return []
-
-    merged = []
-
-    # Merge date if target doesn't have one but source does
-    target_date = get_exif_date(target)
-    if not target_date:
-        source_date = get_exif_date(source)
-        if source_date:
-            try:
-                write_exif_date(target, source_date)
-                merged.append("date")
-                if db:
-                    db.log_metadata_merge(str(target), str(source), "date", source_date)
-            except Exception:
-                pass
-
-    # Merge GPS if target doesn't have it but source does
-    target_gps = get_exif_gps(target)
-    if not target_gps:
-        source_gps = get_exif_gps(source)
-        if source_gps:
-            try:
-                write_exif_gps(target, source_gps[0], source_gps[1])
-                merged.append("gps")
-                if db:
-                    db.log_metadata_merge(str(target), str(source), "gps",
-                                          f"{source_gps[0]},{source_gps[1]}")
-            except Exception:
-                pass
-
-    return merged
+# NOTE: `merge_metadata_from_sidecar` and `merge_metadata_from_file` used to
+# live here. Both wrote EXIF directly and swallowed every failure, which made
+# them a second, unaccountable path around the outcome tables. Metadata now
+# flows through `memoryvault.ingest.apply_sidecar`, which is the only place
+# allowed to decide — see `merge_metadata_between_files` for the file-to-file
+# entry point.

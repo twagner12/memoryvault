@@ -1,5 +1,6 @@
 """Stream files from zip archives using libarchive, with 7z CLI fallback."""
 
+import logging
 import os
 import subprocess
 import tempfile
@@ -8,8 +9,18 @@ from pathlib import Path
 
 import libarchive
 
+logger = logging.getLogger(__name__)
+
 # Files larger than this are written to a temp file instead of memory
 LARGE_FILE_THRESHOLD = 50 * 1024 * 1024  # 50 MB
+
+
+def _discard_temp(name: str):
+    """Remove a half-written temp file, reporting rather than hiding failure."""
+    try:
+        os.unlink(name)
+    except OSError as exc:
+        logger.warning("could not remove temp file %s: %s", name, exc)
 
 
 @dataclass
@@ -37,8 +48,11 @@ class ArchiveEntry:
         if self.temp_path and self.temp_path.exists():
             try:
                 self.temp_path.unlink()
-            except OSError:
-                pass
+            except OSError as exc:
+                # The temp file is ours and already unreferenced; failing to
+                # remove it leaks disk, but losing the entry would be worse.
+                logger.warning("could not remove temp file %s: %s",
+                               self.temp_path, exc)
 
 
 def stream_entries(archive_path: Path, skip_entries: set[str] = None) -> list[ArchiveEntry]:
@@ -145,10 +159,7 @@ def _read_to_temp(entry) -> ArchiveEntry:
         )
     except Exception:
         tmp.close()
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+        _discard_temp(tmp.name)
         return ArchiveEntry(path=entry.pathname, size=0, data=None)
 
 
@@ -169,10 +180,7 @@ def _spill_to_temp(pathname: str, initial_data: bytes, entry) -> ArchiveEntry:
         )
     except Exception:
         tmp.close()
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+        _discard_temp(tmp.name)
         return ArchiveEntry(path=pathname, size=0, data=None)
 
 

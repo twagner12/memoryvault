@@ -1,17 +1,34 @@
-"""Takeout ingestion pipeline: stream from zip → hash → dedup → keep/skip."""
+"""Takeout ingestion pipeline: stream from zip → hash → dedup → keep/skip.
+
+Metadata handling funnels through `apply_sidecar`, the single place allowed to
+decide what happens to a date or a location. Every (file, field) it touches
+leaves a record — a `metadata_log` row, a `metadata_pending` row, or both in
+the two cases where a partial success and an outstanding value coexist. That
+is what makes findings #7, #8, #9 and #10 verifiable rather than hopeful.
+"""
 
 import json
+import logging
+import os
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 
-from memoryvault.archive import iter_entries, count_entries, extract_entry_to_path, ArchiveEntry
+from memoryvault.archive import iter_entries, extract_entry_to_path, ArchiveEntry
+from memoryvault.containers import detect_container, supports_exif
 from memoryvault.database import Database
 from memoryvault.hasher import hash_bytes, hash_full, hash_head, hash_tail
 from memoryvault.metadata import (
-    parse_takeout_sidecar, can_have_exif, has_metadata,
+    UnparseableExifError, can_have_exif, has_metadata,
     get_exif_date, get_exif_gps,
     write_exif_date, write_exif_gps,
 )
+from memoryvault.phototime import resolve_capture_time
+from memoryvault.sidecar_names import (
+    UnmatchedReason, is_sidecar_name, resolve_media_name,
+)
 from memoryvault.volumes import assert_volumes_reachable
+
+logger = logging.getLogger(__name__)
 
 # Extensions we consider media files
 MEDIA_EXTENSIONS = {
@@ -30,23 +47,11 @@ def is_media_file(path: str) -> bool:
 
 
 def is_sidecar_json(path: str) -> bool:
-    p = path.lower()
-    return p.endswith(".supplemental-metadata.json") or (
-        p.endswith(".json") and not Path(path).stem.lower() == "metadata"
-    )
+    return is_sidecar_name(Path(path).name)
 
 
 def is_metadata_json(path: str) -> bool:
     return Path(path).name.lower() == "metadata.json"
-
-
-def _media_name_for_sidecar(sidecar_path: str) -> str | None:
-    """Given a sidecar JSON path, return the media file path it belongs to."""
-    if sidecar_path.endswith(".supplemental-metadata.json"):
-        return sidecar_path[:-len(".supplemental-metadata.json")]
-    elif sidecar_path.endswith(".json"):
-        return sidecar_path[:-len(".json")]
-    return None
 
 
 def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
@@ -103,12 +108,24 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
     db.update_archive_status(archive_id, "in_progress")
     already_processed = db.get_processed_entries(archive_id)
 
-    stats = {"kept": 0, "skipped": 0, "errors": 0, "merged_metadata": 0}
+    stats = {"kept": 0, "skipped": 0, "errors": 0, "merged_metadata": 0,
+             "sidecars_matched": 0, "sidecars_unmatched": 0,
+             "metadata_deferred": 0, "metadata_failed": 0}
 
-    # Sidecars are small (just JSON text) — safe to buffer
+    # Sidecars are small (just JSON text) — safe to buffer.
+    # Keyed by the *resolved* media entry path, so a lookup by a media file's
+    # own path finds it regardless of how Google mangled the sidecar name.
     sidecars: dict[str, dict] = {}
-    # Track where media files were saved so late-arriving sidecars can be applied
-    kept_media: dict[str, str] = {}  # archive_path -> dest_path
+    # Every sidecar seen, so the post-pass can retry the ones that did not
+    # bind while streaming and record whatever is still left over.
+    seen_sidecars: list[dict] = []
+    # Media filenames per directory within the archive, built as we stream.
+    # The fuzzy tier needs a directory's full listing, which only exists once
+    # the archive has been walked — hence the post-pass.
+    dir_media: dict[str, list[str]] = {}
+    # Where each media entry ended up on disk: the kept copy, or the surviving
+    # duplicate its metadata was merged into.
+    media_dest: dict[str, str] = {}
 
     processed_count = 0
 
@@ -129,25 +146,24 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
             continue
 
         if is_sidecar_json(entry.path):
-            # Parse and store sidecar — these are tiny (< 1KB each)
-            try:
-                raw = entry.read_data()
-                if not raw:
-                    continue
-                sidecar_data = json.loads(raw.decode("utf-8"))
-                media_name = _media_name_for_sidecar(entry.path)
-                if media_name:
-                    parsed = _parse_sidecar_data(sidecar_data)
-                    sidecars[media_name] = parsed
+            record = _read_sidecar_entry(entry)
+            if record is not None:
+                seen_sidecars.append(record)
+                # Register under every name shape this sidecar could belong
+                # to, so a media entry arriving later finds it by its own path.
+                for candidate in record["candidates"]:
+                    sidecars.setdefault(candidate, record["parsed"])
 
-                    # Check if we already saved this media file (sidecar arrived late)
-                    if media_name in kept_media:
-                        merged = _apply_sidecar_to_file(
-                            kept_media[media_name], parsed, entry.path, db)
-                        if merged:
-                            stats["merged_metadata"] += len(merged)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
+                # The media file may already have been processed.
+                for candidate in record["candidates"]:
+                    dest = media_dest.get(candidate)
+                    if dest:
+                        outcome = _apply_sidecar_to_file(
+                            dest, record["parsed"], entry.path, db)
+                        _tally(stats, outcome)
+                        record["bound"] = True
+                        break
+
             db.log_archive_entry(archive_id, entry.path, "skipped", skip_reason="sidecar")
             stats["skipped"] += 1
             processed_count += 1
@@ -159,6 +175,9 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
             processed_count += 1
             continue
 
+        directory = str(Path(entry.path).parent)
+        dir_media.setdefault(directory, []).append(Path(entry.path).name)
+
         # Process media file immediately — no buffering
         try:
             result = _process_media_entry(entry, dest_folder, db, sidecars, archive_id)
@@ -168,10 +187,10 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
             processed_count += 1
             continue
         stats[result["action"]] += 1
-        if result.get("merged"):
-            stats["merged_metadata"] += len(result["merged"])
+        if result.get("outcome"):
+            _tally(stats, result["outcome"])
         if result.get("dest_path"):
-            kept_media[entry.path] = result["dest_path"]
+            media_dest[entry.path] = result["dest_path"]
 
         processed_count += 1
 
@@ -181,12 +200,19 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
                               kept=stats["kept"], skipped=stats["skipped"],
                               errors=stats["errors"], merged=stats["merged_metadata"])
 
+    # Sidecars that never bound while streaming get one more attempt now that
+    # every directory's media listing is complete; whatever is still unbound
+    # is recorded rather than dropped.
+    _resolve_leftover_sidecars(db, archive_id, seen_sidecars, dir_media,
+                               media_dest, stats)
+
     # Mark archive complete
     db.update_archive_status(archive_id, "complete", entries_processed=processed_count)
 
     # Verification: compute sizes
     kept_size = 0
     skipped_dupe_count = 0
+    missing_kept = 0
     for row in db.conn.execute(
         "SELECT status, skip_reason, kept_path FROM archive_entries WHERE archive_id = ?",
         (archive_id,)
@@ -195,12 +221,15 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
             try:
                 kept_size += Path(row["kept_path"]).stat().st_size
             except OSError:
-                pass
+                # A file we logged as kept is no longer readable. That is a
+                # real discrepancy, not a rounding error in the size total.
+                missing_kept += 1
         if row["skip_reason"] == "duplicate":
             skipped_dupe_count += 1
 
     stats["processed_count"] = processed_count
     stats["kept_size_bytes"] = kept_size
+    stats["missing_kept_files"] = missing_kept
     stats["skipped_duplicate_count"] = skipped_dupe_count
     stats["sidecar_count"] = stats["skipped"] - skipped_dupe_count
     stats["verified"] = (stats["kept"] + stats["skipped"] + stats["errors"] == processed_count)
@@ -211,29 +240,121 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
     return stats
 
 
-def _parse_sidecar_data(data: dict) -> dict:
-    """Extract date and GPS from raw sidecar JSON data."""
-    from datetime import datetime, timezone
+def _read_sidecar_entry(entry: ArchiveEntry) -> dict | None:
+    """Parse a sidecar entry into its payload and the media names it may name.
 
-    result = {"date": None, "lat": None, "lon": None}
+    Returns None only when the JSON itself is unreadable — that is a corrupt
+    entry, not an unmatched sidecar, and there is nothing to rebind later.
+    """
+    raw = entry.read_data()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+    entry_path = Path(entry.path)
+    directory = str(entry_path.parent)
+    resolved = resolve_media_name(entry_path.name, candidates=[])
+    parsed_name = resolved.parsed
+
+    candidates = [f"{directory}/{name}" for name in parsed_name.all_candidates]
+
+    return {
+        "entry_path": entry.path,
+        "entry_name": entry_path.name,
+        "directory": directory,
+        "parsed": _parse_sidecar_data(data),
+        "name_parts": parsed_name,
+        "candidates": candidates,
+        "bound": False,
+    }
+
+
+def _tally(stats: dict, outcome: "Outcome"):
+    """Fold one outcome into the run's counters."""
+    stats["merged_metadata"] += outcome.log_count
+    stats["metadata_deferred"] += len(outcome.deferred)
+    stats["metadata_failed"] += len(outcome.failed)
+
+
+def _resolve_leftover_sidecars(db: Database, archive_id: int,
+                               seen_sidecars: list[dict],
+                               dir_media: dict[str, list[str]],
+                               media_dest: dict[str, str], stats: dict):
+    """Re-resolve unbound sidecars against complete directory listings.
+
+    Anything still unbound is written to `sidecars_unmatched` *with its parsed
+    payload*, because the Takeout zips will not be re-read: 18,840 sidecars
+    were previously parsed, discarded and logged as `skipped/sidecar`,
+    indistinguishable from success.
+    """
+    for record in seen_sidecars:
+        if record["bound"]:
+            stats["sidecars_matched"] += 1
+            continue
+
+        listing = dir_media.get(record["directory"], [])
+        resolved = resolve_media_name(record["entry_name"], candidates=listing)
+
+        dest = None
+        if resolved.media_name:
+            dest = media_dest.get(f"{record['directory']}/{resolved.media_name}")
+
+        if dest:
+            outcome = _apply_sidecar_to_file(dest, record["parsed"],
+                                             record["entry_path"], db)
+            _tally(stats, outcome)
+            stats["sidecars_matched"] += 1
+            continue
+
+        # Either no media name could be derived, or the media it names was
+        # never kept (already a duplicate elsewhere, or absent from the zip).
+        reason = resolved.reason or UnmatchedReason.NO_MEDIA_IN_DIR
+        parts = record["name_parts"]
+        db.record_unmatched_sidecar(
+            archive_id=archive_id,
+            sidecar_path=record["entry_path"],
+            archive_dir=record["directory"],
+            entry_name=record["entry_name"],
+            media_stem=parts.media_name,
+            counter=parts.counter,
+            reason=reason.value,
+            candidate_count=resolved.candidate_count,
+            payload=json.dumps(record["parsed"]),
+        )
+        stats["sidecars_unmatched"] += 1
+
+
+def _parse_sidecar_data(data: dict) -> dict:
+    """Extract the raw UTC epoch and GPS from sidecar JSON.
+
+    The epoch is deliberately *not* converted to a datetime here. Takeout's
+    timestamp is UTC; EXIF wants camera-local wall-clock time. Doing the
+    conversion at parse time, with no location in hand, is what produced the
+    ±14 h drift of finding #9 — so it is deferred to `phototime`, which has
+    the file and its siblings available.
+    """
+    result = {"utc_epoch": None, "lat": None, "lon": None}
 
     for time_key in ("photoTakenTime", "creationTime"):
         time_data = data.get(time_key)
         if time_data and "timestamp" in time_data:
             try:
                 ts = int(time_data["timestamp"])
-                if ts > 0:
-                    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                    result["date"] = dt.isoformat()
-                    break
-            except (ValueError, OSError):
+            except (TypeError, ValueError):
                 continue
+            if ts > 0:
+                result["utc_epoch"] = ts
+                break
 
     for geo_key in ("geoData", "geoDataExif"):
         geo = data.get(geo_key)
         if geo:
             lat = geo.get("latitude", 0)
             lon = geo.get("longitude", 0)
+            # Google writes 0,0 to mean "no location".
             if lat != 0 or lon != 0:
                 result["lat"] = lat
                 result["lon"] = lon
@@ -242,36 +363,211 @@ def _parse_sidecar_data(data: dict) -> dict:
     return result
 
 
+@dataclass
+class Outcome:
+    """What happened to each field of one sidecar, for one file.
+
+    A field appears in exactly one of these lists, except for the two
+    deliberate dual states: a date that reached only the filesystem mtime is
+    both `merged_mtime_only` and `deferred`, and a date written under an
+    assumed UTC offset is both `merged` and `deferred`.
+    """
+    merged: list[str] = dataclass_field(default_factory=list)
+    merged_mtime_only: list[str] = dataclass_field(default_factory=list)
+    deferred: list[str] = dataclass_field(default_factory=list)
+    failed: list[str] = dataclass_field(default_factory=list)
+    already_present: list[str] = dataclass_field(default_factory=list)
+
+    @property
+    def changed_file(self) -> bool:
+        """True when the file's bytes or mtime moved, so its row must follow."""
+        return bool(self.merged or self.merged_mtime_only)
+
+    @property
+    def log_count(self) -> int:
+        """Fields that produced a metadata_log row — what `stats` counts."""
+        return len(self.merged) + len(self.merged_mtime_only)
+
+
+def apply_sidecar(path: Path, sidecar: dict, db: Database, source_desc: str,
+                  siblings: list[Path] | None = None) -> Outcome:
+    """The one place metadata is applied. Every outcome is recorded.
+
+    Routes on the file's *container*, sniffed from its bytes, never on its
+    extension — 12% of `.heic` files in the corpus are really JPEG, and
+    genuine HEIC cannot take an EXIF write at all.
+
+    - container supports EXIF → write; on refusal record `failed`
+    - container cannot        → set the mtime from the date (all a video can
+                                hold) and record the real value as `deferred`
+
+    Fields the file already carries are left alone: a sidecar is a fallback
+    for missing metadata, not an authority over what the camera recorded.
+    """
+    outcome = Outcome()
+    if not path.exists():
+        raise FileNotFoundError(f"apply_sidecar: {path} does not exist")
+
+    has_date = sidecar.get("utc_epoch") is not None
+    has_gps = sidecar.get("lat") is not None
+    if not has_date and not has_gps:
+        return outcome
+
+    container = detect_container(path)
+    writable = supports_exif(container)
+
+    capture = None
+    if has_date:
+        geo = ({"lat": sidecar["lat"], "lon": sidecar["lon"]} if has_gps
+               else None)
+        capture = resolve_capture_time(sidecar["utc_epoch"], geo, path,
+                                       siblings=list(siblings or []))
+
+    if writable:
+        if has_date:
+            _apply_date_to_exif(path, capture, sidecar["utc_epoch"], db,
+                               source_desc, outcome)
+        if has_gps:
+            _apply_gps_to_exif(path, sidecar, db, source_desc, outcome)
+    else:
+        reason = f"unsupported_{container.value}"
+        if has_date:
+            _apply_date_as_mtime(path, sidecar["utc_epoch"], capture, db,
+                                 source_desc, reason, outcome)
+        if has_gps:
+            db.record_pending(str(path), "gps", _gps_payload(sidecar), reason,
+                              "deferred", source_desc=source_desc,
+                              file_blake3=hash_full(path))
+            outcome.deferred.append("gps")
+
+    return outcome
+
+
+def _date_payload(capture, utc_epoch: int) -> str:
+    """Everything a drain pass needs to re-apply this date without the sidecar.
+
+    Both renderings are stored: the local wall clock actually written to EXIF,
+    and the original UTC instant it came from. Keeping the epoch means a later
+    pass that learns the true timezone can redo the conversion, rather than
+    having to undo ours.
+    """
+    from datetime import datetime, timezone
+
+    return json.dumps({
+        "datetime_local": capture.local_dt.isoformat(),
+        "offset": capture.offset,
+        "utc": datetime.fromtimestamp(utc_epoch, tz=timezone.utc).isoformat(),
+        "utc_epoch": utc_epoch,
+        "tz": capture.tz_name,
+        "tz_source": capture.tz_source.value,
+    })
+
+
+def _gps_payload(sidecar: dict) -> str:
+    return json.dumps({
+        "lat": sidecar["lat"], "lon": sidecar["lon"],
+        "altitude": None, "altitude_ref": None,
+    })
+
+
+def _apply_date_to_exif(path: Path, capture, utc_epoch: int, db: Database,
+                        source_desc: str, outcome: Outcome):
+    if get_exif_date(path):
+        outcome.already_present.append("date")
+        return
+
+    payload = _date_payload(capture, utc_epoch)
+    try:
+        write_exif_date(path, capture.local_dt, capture.offset)
+    except UnparseableExifError:
+        db.record_pending(str(path), "date", payload, "failed_unparseable",
+                          "failed", source_desc=source_desc,
+                          file_blake3=hash_full(path))
+        outcome.failed.append("date")
+        return
+    except Exception as exc:
+        db.record_pending(str(path), "date", payload,
+                          f"failed_write_error:{type(exc).__name__}",
+                          "failed", source_desc=source_desc,
+                          file_blake3=hash_full(path))
+        outcome.failed.append("date")
+        return
+
+    db.log_metadata_merge(str(path), source_desc, "date", payload)
+    outcome.merged.append("date")
+
+    if capture.is_assumed:
+        # Written, but on a guessed offset. Recorded so a later pass can
+        # revisit it once a better timezone source exists.
+        db.record_pending(str(path), "date", payload, "tz_unknown_assumed_utc",
+                          "deferred", source_desc=source_desc,
+                          file_blake3=hash_full(path))
+        outcome.deferred.append("date")
+
+
+def _apply_gps_to_exif(path: Path, sidecar: dict, db: Database,
+                       source_desc: str, outcome: Outcome):
+    if get_exif_gps(path):
+        outcome.already_present.append("gps")
+        return
+
+    payload = _gps_payload(sidecar)
+    try:
+        write_exif_gps(path, sidecar["lat"], sidecar["lon"])
+    except UnparseableExifError:
+        db.record_pending(str(path), "gps", payload, "failed_unparseable",
+                          "failed", source_desc=source_desc,
+                          file_blake3=hash_full(path))
+        outcome.failed.append("gps")
+        return
+    except Exception as exc:
+        db.record_pending(str(path), "gps", payload,
+                          f"failed_write_error:{type(exc).__name__}",
+                          "failed", source_desc=source_desc,
+                          file_blake3=hash_full(path))
+        outcome.failed.append("gps")
+        return
+
+    db.log_metadata_merge(str(path), source_desc, "gps", payload)
+    outcome.merged.append("gps")
+
+
+def _apply_date_as_mtime(path: Path, utc_epoch: int, capture, db: Database,
+                         source_desc: str, reason: str, outcome: Outcome):
+    """Recover a date for containers that cannot hold EXIF (#8).
+
+    4,741 Takeout videos landed in the vault with their date discarded, to be
+    re-dated by every downstream tool as the moment of ingest. The mtime is
+    the only field an mp4 or a genuine HEIC will accept without an exiftool
+    dependency, so it is set — and the real value is still recorded as
+    outstanding, because an mtime is a weaker claim than embedded metadata.
+    """
+    payload = _date_payload(capture, utc_epoch)
+
+    # utc_epoch, not the local wall clock: mtime is an absolute instant.
+    os.utime(path, (utc_epoch, utc_epoch))
+    db.log_metadata_merge(str(path), source_desc, "merged_mtime_only", payload)
+    outcome.merged_mtime_only.append("date")
+
+    db.record_pending(str(path), "date", payload, reason, "deferred",
+                      source_desc=source_desc, file_blake3=hash_full(path))
+    outcome.deferred.append("date")
+
+
 def _apply_sidecar_to_file(dest_path: str, sidecar: dict, source_desc: str,
-                           db: Database) -> list[str]:
-    """Apply sidecar metadata to an already-saved file (for late-arriving sidecars)."""
-    merged = []
+                           db: Database, siblings: list[Path] | None = None
+                           ) -> Outcome:
+    """Apply a late-arriving sidecar to an already-saved file."""
     path = Path(dest_path)
-    if not path.exists() or not can_have_exif(path):
-        return merged
+    if not path.exists():
+        return Outcome()
 
-    if sidecar.get("date") and not get_exif_date(path):
-        try:
-            write_exif_date(path, sidecar["date"])
-            db.log_metadata_merge(dest_path, f"takeout:{source_desc}", "date", sidecar["date"])
-            merged.append("date")
-        except Exception:
-            pass
-
-    if sidecar.get("lat") is not None and not get_exif_gps(path):
-        try:
-            write_exif_gps(path, sidecar["lat"], sidecar["lon"])
-            db.log_metadata_merge(dest_path, f"takeout:{source_desc}", "gps",
-                                  f"{sidecar['lat']},{sidecar['lon']}")
-            merged.append("gps")
-        except Exception:
-            pass
-
-    if merged:
-        # The file's bytes just changed; its row must follow.
+    outcome = apply_sidecar(path, sidecar, db, f"takeout:{source_desc}",
+                            siblings=siblings)
+    if outcome.changed_file:
+        # The file's bytes or mtime just changed; its row must follow.
         _index_saved_file(db, path)
-
-    return merged
+    return outcome
 
 
 def _process_media_entry(entry: ArchiveEntry, dest_folder: Path, db: Database,
@@ -289,8 +585,6 @@ def _process_media_entry(entry: ArchiveEntry, dest_folder: Path, db: Database,
 
 def _process_media_entry_inner(entry: ArchiveEntry, dest_folder: Path, db: Database,
                                sidecars: dict, archive_id: int) -> dict:
-    size = entry.size
-
     # Hash the source bytes — from disk for large files, from memory for small.
     # This is the entry's identity as it came out of the archive, and is stored
     # as source_blake3; it is NOT necessarily the hash of what we write, because
@@ -307,9 +601,12 @@ def _process_media_entry_inner(entry: ArchiveEntry, dest_folder: Path, db: Datab
     surviving = [c for c in candidates if Path(c["path"]).exists()]
 
     if surviving:
-        merged = _try_merge_from_duplicate(entry, surviving[0], sidecars, db)
+        outcome = _try_merge_from_duplicate(entry, surviving[0], sidecars, db)
         db.log_archive_entry(archive_id, entry.path, "skipped", skip_reason="duplicate")
-        return {"action": "skipped", "merged": merged}
+        # The surviving copy is where this entry's metadata now lives, so a
+        # late-arriving sidecar must be routed there rather than dropped.
+        return {"action": "skipped", "outcome": outcome,
+                "dest_path": surviving[0]["path"]}
 
     # Matched the index but every copy is gone — treat as new and record why,
     # so the decision is queryable rather than silent.
@@ -332,26 +629,10 @@ def _process_media_entry_inner(entry: ArchiveEntry, dest_folder: Path, db: Datab
         return {"action": "errors"}
 
     # Apply sidecar metadata if available (sidecar arrived before media file)
-    merged = []
+    outcome = Outcome()
     sidecar = sidecars.get(entry.path)
-    if sidecar and can_have_exif(dest_path):
-        if sidecar.get("date") and not get_exif_date(dest_path):
-            try:
-                write_exif_date(dest_path, sidecar["date"])
-                db.log_metadata_merge(str(dest_path), f"takeout:{entry.path}", "date",
-                                      sidecar["date"])
-                merged.append("date")
-            except Exception:
-                pass
-
-        if sidecar.get("lat") is not None and not get_exif_gps(dest_path):
-            try:
-                write_exif_gps(dest_path, sidecar["lat"], sidecar["lon"])
-                db.log_metadata_merge(str(dest_path), f"takeout:{entry.path}", "gps",
-                                      f"{sidecar['lat']},{sidecar['lon']}")
-                merged.append("gps")
-            except Exception:
-                pass
+    if sidecar:
+        outcome = apply_sidecar(dest_path, sidecar, db, f"takeout:{entry.path}")
 
     # Index the file as it now stands on disk. Metadata writes above changed
     # both its size and its bytes, so every hash must be taken after them.
@@ -359,7 +640,7 @@ def _process_media_entry_inner(entry: ArchiveEntry, dest_folder: Path, db: Datab
 
     db.log_archive_entry(archive_id, entry.path, "kept", kept_path=str(dest_path),
                          skip_reason=keep_reason)
-    return {"action": "kept", "merged": merged, "dest_path": str(dest_path)}
+    return {"action": "kept", "outcome": outcome, "dest_path": str(dest_path)}
 
 
 def _index_saved_file(db: Database, path: Path, source_hash: str | None = None,
@@ -398,68 +679,142 @@ def _index_saved_file(db: Database, path: Path, source_hash: str | None = None,
 
 
 def _try_merge_from_duplicate(entry: ArchiveEntry, existing: dict,
-                              sidecars: dict, db: Database) -> list[str]:
-    """Try to merge metadata from a skipped duplicate into the kept file.
+                              sidecars: dict, db: Database) -> Outcome:
+    """Merge metadata from a skipped duplicate into the surviving copy.
 
-    Checks two sources:
-    1. The Takeout JSON sidecar (if available)
-    2. The duplicate file's own EXIF data (file-to-file merge)
+    Two sources, both routed through `apply_sidecar` so the outcome is
+    recorded either way:
+    1. The Takeout JSON sidecar, if one named this entry
+    2. The duplicate's own EXIF, which may carry what the kept copy lacks
     """
-    from memoryvault.metadata import merge_metadata_from_file
     import tempfile
 
-    merged = []
+    outcome = Outcome()
     existing_path = Path(existing["path"])
     if not existing_path.exists():
-        return merged
+        return outcome
 
-    # First: try sidecar metadata
     sidecar = sidecars.get(entry.path)
-    if sidecar and can_have_exif(existing_path):
-        if sidecar.get("date") and not existing.get("has_exif_date"):
-            try:
-                write_exif_date(existing_path, sidecar["date"])
-                db.log_metadata_merge(str(existing_path), f"takeout:{entry.path}", "date",
-                                      sidecar["date"])
-                merged.append("date")
-            except Exception:
-                pass
+    if sidecar:
+        outcome = apply_sidecar(existing_path, sidecar, db,
+                                f"takeout:{entry.path}")
 
-        if sidecar.get("lat") is not None and not existing.get("has_exif_gps"):
-            try:
-                write_exif_gps(existing_path, sidecar["lat"], sidecar["lon"])
-                db.log_metadata_merge(str(existing_path), f"takeout:{entry.path}", "gps",
-                                      f"{sidecar['lat']},{sidecar['lon']}")
-                merged.append("gps")
-            except Exception:
-                pass
-
-    # Second: try file-to-file merge (duplicate may have EXIF the kept file lacks)
-    if can_have_exif(existing_path) and ("date" not in merged or "gps" not in merged):
-        # Need to write the duplicate to a temp file to read its EXIF
+    # File-to-file: the discarded duplicate may hold EXIF the kept copy lacks.
+    # Only worth reading if something is still missing.
+    if "date" not in outcome.merged or "gps" not in outcome.merged:
         if entry.is_large and entry.temp_path:
-            source_path = entry.temp_path
-            file_merged = merge_metadata_from_file(existing_path, source_path, db=db)
-            merged.extend(file_merged)
+            _merge_from_source_file(existing_path, entry.temp_path, db,
+                                    entry.path, outcome)
         elif entry.data:
             suffix = Path(entry.path).suffix
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 tmp.write(entry.data)
                 tmp_path = Path(tmp.name)
             try:
-                file_merged = merge_metadata_from_file(existing_path, tmp_path, db=db)
-                merged.extend(file_merged)
+                _merge_from_source_file(existing_path, tmp_path, db,
+                                        entry.path, outcome)
             finally:
                 try:
                     tmp_path.unlink()
-                except OSError:
-                    pass
+                except OSError as exc:
+                    logger.warning("could not remove temp file %s: %s",
+                                   tmp_path, exc)
 
-    if merged:
+    if outcome.changed_file:
         # Metadata was written into the kept file, changing its bytes and size.
         _index_saved_file(db, existing_path)
 
-    return merged
+    return outcome
+
+
+def merge_metadata_between_files(target: Path, source: Path, db: Database
+                                 ) -> Outcome:
+    """Copy date/GPS the target lacks from another file, via the choke point.
+
+    The public entry point for file-to-file merges (the `merge` command).
+    Replaces `metadata.merge_metadata_from_file`, which wrote EXIF directly
+    and discarded every failure.
+    """
+    outcome = Outcome()
+    if not target.exists() or not source.exists():
+        return outcome
+
+    _merge_from_source_file(target, source, db, str(source), outcome)
+    if outcome.changed_file:
+        _index_saved_file(db, target)
+    return outcome
+
+
+def _merge_from_source_file(target: Path, source: Path, db: Database,
+                            entry_path: str, outcome: Outcome):
+    """Copy date/GPS the target lacks from a duplicate's own EXIF.
+
+    Reuses the choke point by converting the source's EXIF into the same
+    shape a sidecar produces, so a file-to-file merge is recorded exactly
+    like a sidecar merge and cannot become a silent fourth path.
+    """
+    from datetime import datetime
+
+    if not can_have_exif(source):
+        return
+
+    offer: dict = {"utc_epoch": None, "lat": None, "lon": None}
+
+    if "date" not in outcome.merged and "date" not in outcome.already_present:
+        source_date = get_exif_date(source)
+        if source_date:
+            try:
+                naive = datetime.fromisoformat(source_date)
+            except ValueError:
+                naive = None
+            if naive is not None:
+                # The source's DateTimeOriginal is already a local wall clock.
+                # Recording it as a UTC epoch would re-shift it, so it is
+                # applied directly rather than through the timezone tiers.
+                _copy_exif_date(target, naive, source, db, entry_path, outcome)
+
+    source_gps = get_exif_gps(source)
+    if source_gps and "gps" not in outcome.merged and \
+            "gps" not in outcome.already_present:
+        offer["lat"], offer["lon"] = source_gps
+        _apply_gps_to_exif(target, offer, db, f"file:{source}", outcome)
+
+
+def _copy_exif_date(target: Path, local_dt, source: Path, db: Database,
+                    entry_path: str, outcome: Outcome):
+    """Carry a wall-clock date across, preserving the source's declared offset."""
+    from memoryvault.metadata import get_exif_offset
+
+    if get_exif_date(target):
+        outcome.already_present.append("date")
+        return
+
+    offset = get_exif_offset(source)
+    payload = json.dumps({
+        "datetime_local": local_dt.isoformat(),
+        "offset": offset,
+        "tz": None,
+        "tz_source": "source_file",
+    })
+
+    try:
+        write_exif_date(target, local_dt, offset)
+    except UnparseableExifError:
+        db.record_pending(str(target), "date", payload, "failed_unparseable",
+                          "failed", source_desc=f"file:{source}",
+                          file_blake3=hash_full(target))
+        outcome.failed.append("date")
+        return
+    except Exception as exc:
+        db.record_pending(str(target), "date", payload,
+                          f"failed_write_error:{type(exc).__name__}",
+                          "failed", source_desc=f"file:{source}",
+                          file_blake3=hash_full(target))
+        outcome.failed.append("date")
+        return
+
+    db.log_metadata_merge(str(target), f"file:{source}", "date", payload)
+    outcome.merged.append("date")
 
 
 def _unique_dest_path(dest_folder: Path, filename: str) -> Path:

@@ -74,6 +74,41 @@ CREATE TABLE IF NOT EXISTS resolutions (
     stale INTEGER DEFAULT 0
 );
 
+-- Metadata that was resolved but could not be embedded, or whose embedding
+-- failed. Together with metadata_log this makes every outcome recorded:
+-- merged (log), deferred (here), failed (here). Rows are self-contained so a
+-- future drain pass needs neither the sidecar nor the original zip.
+CREATE TABLE IF NOT EXISTS metadata_pending (
+    id           INTEGER PRIMARY KEY,
+    file_id      INTEGER REFERENCES files(id),
+    file_path    TEXT NOT NULL,      -- denormalised: survives a re-index
+    file_blake3  TEXT,               -- content at record time; drain re-verifies
+    field        TEXT NOT NULL,      -- 'date' | 'gps'
+    value        TEXT NOT NULL,      -- fully resolved JSON payload
+    reason       TEXT NOT NULL,
+    state        TEXT NOT NULL,      -- 'deferred' | 'failed'
+    source_desc  TEXT,               -- 'takeout:<entry path within archive>'
+    recorded_at  TEXT NOT NULL,
+    applied_at   TEXT                -- NULL = outstanding
+);
+
+-- Sidecars whose media file could not be identified. Carries the parsed
+-- payload as well as the name parts, because the Takeout zips are gone and
+-- cannot be re-read — a later rebind pass must work from this table alone.
+CREATE TABLE IF NOT EXISTS sidecars_unmatched (
+    id              INTEGER PRIMARY KEY,
+    archive_id      INTEGER REFERENCES archives(id),
+    sidecar_path    TEXT NOT NULL,   -- full entry path of the JSON in the archive
+    archive_dir     TEXT NOT NULL,   -- directory within the archive
+    entry_name      TEXT NOT NULL,   -- sidecar basename
+    media_stem      TEXT,            -- parsed core: the media name we sought
+    counter         TEXT,            -- '(9)' if present
+    reason          TEXT NOT NULL,   -- 'no_media_in_dir'|'ambiguous'|'unparseable'
+    candidate_count INTEGER DEFAULT 0,
+    payload         TEXT,            -- parsed sidecar JSON (date/geo)
+    recorded_at     TEXT NOT NULL,
+    rebound_at      TEXT             -- NULL = still unmatched
+);
 """
 
 # Applied after column migrations: on an older database the columns these
@@ -85,6 +120,11 @@ CREATE INDEX IF NOT EXISTS idx_files_blake3_head ON files(blake3_head);
 CREATE INDEX IF NOT EXISTS idx_files_source_blake3 ON files(source_blake3);
 CREATE INDEX IF NOT EXISTS idx_files_path_stat ON files(path, size, mtime);
 CREATE INDEX IF NOT EXISTS idx_resolutions_blake3 ON resolutions(blake3_full);
+CREATE INDEX IF NOT EXISTS idx_pending_outstanding
+    ON metadata_pending(state, applied_at);
+CREATE INDEX IF NOT EXISTS idx_pending_path ON metadata_pending(file_path);
+CREATE INDEX IF NOT EXISTS idx_unmatched_rebind
+    ON sidecars_unmatched(rebound_at, archive_dir, media_stem);
 """
 
 # Columns added after the initial release. Applied by comparing against
@@ -309,6 +349,93 @@ class Database:
             (target_path, source_desc, field, value, datetime.now(timezone.utc).isoformat()),
         )
         self.conn.commit()
+
+    # --- Metadata pending (deferred / failed) ---
+
+    def record_pending(self, file_path: str, field: str, value: str, reason: str,
+                       state: str, source_desc: str = None,
+                       file_blake3: str = None, file_id: int = None) -> int:
+        """Record metadata that was not embedded, and why.
+
+        `state` is 'deferred' (the container cannot hold it) or 'failed' (the
+        write was attempted and refused). Both are outstanding until a drain
+        pass sets applied_at; neither is a silent loss.
+        """
+        if state not in ("deferred", "failed"):
+            raise ValueError(f"state must be 'deferred' or 'failed', got {state!r}")
+        if field not in ("date", "gps"):
+            raise ValueError(f"field must be 'date' or 'gps', got {field!r}")
+
+        cursor = self.conn.execute(
+            "INSERT INTO metadata_pending "
+            "(file_id, file_path, file_blake3, field, value, reason, state, "
+            " source_desc, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            (file_id, file_path, file_blake3, field, value, reason, state,
+             source_desc, datetime.now(timezone.utc).isoformat()),
+        )
+        row = cursor.fetchone()
+        self.conn.commit()
+        return row["id"]
+
+    def get_pending(self, file_path: str = None, outstanding_only: bool = True
+                    ) -> list[dict]:
+        sql = "SELECT * FROM metadata_pending WHERE 1=1"
+        params: list = []
+        if file_path is not None:
+            sql += " AND file_path = ?"
+            params.append(file_path)
+        if outstanding_only:
+            sql += " AND applied_at IS NULL"
+        rows = self.conn.execute(sql + " ORDER BY id", params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_pending_summary(self) -> list[dict]:
+        """Outstanding pending rows grouped by state, field and reason."""
+        rows = self.conn.execute(
+            "SELECT state, field, reason, COUNT(*) AS count "
+            "FROM metadata_pending WHERE applied_at IS NULL "
+            "GROUP BY state, field, reason ORDER BY count DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- Unmatched sidecars ---
+
+    def record_unmatched_sidecar(self, archive_id: int, sidecar_path: str,
+                                 archive_dir: str, entry_name: str, reason: str,
+                                 media_stem: str = None, counter: str = None,
+                                 candidate_count: int = 0,
+                                 payload: str = None) -> int:
+        """Record a sidecar whose media file could not be identified."""
+        cursor = self.conn.execute(
+            "INSERT INTO sidecars_unmatched "
+            "(archive_id, sidecar_path, archive_dir, entry_name, media_stem, "
+            " counter, reason, candidate_count, payload, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            (archive_id, sidecar_path, archive_dir, entry_name, media_stem,
+             counter, reason, candidate_count, payload,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        row = cursor.fetchone()
+        self.conn.commit()
+        return row["id"]
+
+    def get_unmatched_summary(self) -> list[dict]:
+        """Still-unmatched sidecars grouped by reason."""
+        rows = self.conn.execute(
+            "SELECT reason, COUNT(*) AS count FROM sidecars_unmatched "
+            "WHERE rebound_at IS NULL GROUP BY reason ORDER BY count DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_unmatched(self, archive_id: int = None) -> list[dict]:
+        sql = "SELECT * FROM sidecars_unmatched WHERE rebound_at IS NULL"
+        params: list = []
+        if archive_id is not None:
+            sql += " AND archive_id = ?"
+            params.append(archive_id)
+        rows = self.conn.execute(sql + " ORDER BY id", params).fetchall()
+        return [dict(r) for r in rows]
 
     # --- Resolutions ---
 

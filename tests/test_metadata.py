@@ -1,8 +1,7 @@
 """Tests for memoryvault.metadata."""
 
 import json
-import struct
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 import piexif
@@ -10,7 +9,7 @@ import piexif
 from memoryvault.metadata import (
     get_exif_date, get_exif_gps, write_exif_date, write_exif_gps,
     has_metadata, can_have_exif,
-    parse_takeout_sidecar, find_takeout_sidecar, merge_metadata_from_sidecar,
+    parse_takeout_sidecar, find_takeout_sidecar,
 )
 
 
@@ -68,14 +67,28 @@ def _make_exif_with_gps(lat: float, lon: float) -> dict:
 
 
 class TestCanHaveExif:
-    def test_jpeg(self):
-        assert can_have_exif(Path("photo.jpg"))
-        assert can_have_exif(Path("photo.JPEG"))
+    """Capability now comes from the file's bytes, not its extension (#7)."""
 
-    def test_non_exif(self):
-        assert not can_have_exif(Path("photo.png"))
-        assert not can_have_exif(Path("video.mp4"))
-        assert not can_have_exif(Path("song.mp3"))
+    def test_jpeg(self, tmp_path):
+        assert can_have_exif(_make_jpeg(tmp_path / "photo.jpg"))
+        assert can_have_exif(_make_jpeg(tmp_path / "photo.JPEG"))
+
+    def test_non_exif(self, tmp_path):
+        png = tmp_path / "photo.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+        assert not can_have_exif(png)
+
+        mp4 = tmp_path / "video.mp4"
+        mp4.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16)
+        assert not can_have_exif(mp4)
+
+    def test_extension_does_not_override_bytes(self, tmp_path):
+        """A JPEG named .heic is writable; a real HEIC named .jpg is not."""
+        disguised = _make_jpeg(tmp_path / "actually_jpeg.heic")
+        assert can_have_exif(disguised)
+
+    def test_missing_file_is_not_writable(self, tmp_path):
+        assert not can_have_exif(tmp_path / "nope.jpg")
 
 
 class TestExifDate:
@@ -99,7 +112,7 @@ class TestExifDate:
     def test_write_date(self, tmp_path):
         path = _make_jpeg(tmp_path / "photo.jpg")
         assert get_exif_date(path) is None
-        write_exif_date(path, "2012-07-04T14:30:00")
+        write_exif_date(path, datetime(2012, 7, 4, 14, 30, 0))
         date = get_exif_date(path)
         assert date is not None
         assert "2012-07-04" in date
@@ -153,9 +166,16 @@ class TestTakeoutSidecar:
             "geoData": {"latitude": 41.8781, "longitude": -87.6298, "altitude": 0},
         }))
         result = parse_takeout_sidecar(sidecar)
-        assert result["date"] is not None
+        assert result["utc_epoch"] == 1341415800
         assert result["lat"] is not None
         assert abs(result["lat"] - 41.8781) < 0.001
+
+    def test_timestamp_stays_an_epoch(self, tmp_path):
+        """Converting here, with no location, is what caused #9."""
+        sidecar = tmp_path / "photo.jpg.json"
+        sidecar.write_text(json.dumps({
+            "photoTakenTime": {"timestamp": "1341415800"}}))
+        assert parse_takeout_sidecar(sidecar)["utc_epoch"] == 1341415800
 
     def test_parse_sidecar_zero_gps_is_no_data(self, tmp_path):
         sidecar = tmp_path / "photo.jpg.json"
@@ -172,7 +192,7 @@ class TestTakeoutSidecar:
             "creationTime": {"timestamp": "1341415800"},
         }))
         result = parse_takeout_sidecar(sidecar)
-        assert result["date"] is not None
+        assert result["utc_epoch"] == 1341415800
 
     def test_find_sidecar_supplemental(self, tmp_path):
         media = tmp_path / "photo.jpg"
@@ -196,33 +216,7 @@ class TestTakeoutSidecar:
         assert find_takeout_sidecar(media) is None
 
 
-class TestMergeFromSidecar:
-    def test_merge_date_from_sidecar(self, tmp_path):
-        path = _make_jpeg(tmp_path / "photo.jpg")
-        sidecar = tmp_path / "photo.jpg.supplemental-metadata.json"
-        sidecar.write_text(json.dumps({
-            "photoTakenTime": {"timestamp": "1341415800"},
-        }))
-        merged = merge_metadata_from_sidecar(path, sidecar)
-        assert "date" in merged
-        assert get_exif_date(path) is not None
-
-    def test_no_overwrite_existing_date(self, tmp_path):
-        exif = _make_exif_with_date("2012:07:04 14:30:00")
-        path = _make_jpeg(tmp_path / "photo.jpg", exif)
-        sidecar = tmp_path / "photo.jpg.json"
-        sidecar.write_text(json.dumps({
-            "photoTakenTime": {"timestamp": "0"},
-        }))
-        merged = merge_metadata_from_sidecar(path, sidecar)
-        assert "date" not in merged
-        # Original date preserved
-        assert "2012-07-04" in get_exif_date(path)
-
-    def test_skip_non_exif_files(self, tmp_path):
-        path = tmp_path / "video.mp4"
-        path.write_bytes(b"fake video")
-        sidecar = tmp_path / "video.mp4.json"
-        sidecar.write_text(json.dumps({"photoTakenTime": {"timestamp": "1341415800"}}))
-        merged = merge_metadata_from_sidecar(path, sidecar)
-        assert merged == []
+# `merge_metadata_from_sidecar` was removed: it wrote EXIF directly and
+# swallowed failures, bypassing the outcome tables. Its behaviour — including
+# "do not overwrite an existing date" and "skip non-EXIF containers" — is now
+# covered against the real choke point in tests/test_metadata_outcomes.py.

@@ -1,9 +1,12 @@
 """Thumbnail generation and caching."""
 
+import logging
 import subprocess
 from pathlib import Path
 
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 THUMB_SIZE = 400
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"}
@@ -57,6 +60,8 @@ def _thumbnail_video(source: Path, dest: Path, size: int) -> Path | None:
         )
         if result.returncode == 0 and dest.exists():
             return dest
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        # No ffmpeg, or a clip it cannot decode in time. A missing thumbnail
+        # is cosmetic, but it should not look like a file with no frames.
+        logger.info("no video thumbnail for %s: %s", source, exc)
     return None
