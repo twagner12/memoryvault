@@ -96,7 +96,7 @@ def _stream_libarchive(archive_path: Path, skip_entries: set[str]):
     """
     with libarchive.file_reader(str(archive_path)) as archive:
         for entry in archive:
-            if entry.isdir:
+            if entry.isdir or entry.pathname.endswith("/"):
                 continue
             if entry.pathname in skip_entries:
                 # Must still consume the blocks to advance the archive

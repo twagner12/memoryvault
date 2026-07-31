@@ -101,16 +101,24 @@ class TestIngestArchive:
         db.close()
 
     def test_ingest_skips_already_in_db(self, tmp_path):
-        """Files already scanned locally should be skipped."""
+        """Files already scanned locally should be skipped.
+
+        The previously-scanned copy must exist on disk: a skip is only safe if
+        the file being kept is really there (finding #1).
+        """
         jpeg = _make_jpeg_bytes()
 
-        # Pre-populate DB with this file
+        # Pre-populate DB with this file, and put it where the row claims it is.
         from memoryvault.hasher import hash_bytes
+        existing = tmp_path / "existing" / "photo.jpg"
+        existing.parent.mkdir(parents=True)
+        existing.write_bytes(jpeg)
+
         db = Database(tmp_path / "test.db")
         full_hash = hash_bytes(jpeg)
         head_hash = hash_bytes(jpeg[:65_536])
         db.upsert_file(
-            path="/existing/photo.jpg", size=len(jpeg),
+            path=str(existing), size=len(jpeg),
             blake3_full=full_hash, blake3_head=head_hash, blake3_tail=head_hash,
         )
 

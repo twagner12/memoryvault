@@ -4,13 +4,14 @@ from pathlib import Path
 
 import click
 
-from memoryvault.database import Database
+from memoryvault.database import Database, mark_auto_resolutions_stale
 from memoryvault.scanner import scan_folder
 from memoryvault.dedup import find_duplicates
 from memoryvault.metadata import (
     get_exif_date, get_exif_gps, write_exif_date, write_exif_gps, can_have_exif,
 )
 from memoryvault.ingest import ingest_archive
+from memoryvault.volumes import UnreachableVolumeError, find_unreachable_volumes
 
 
 @click.group()
@@ -144,8 +145,11 @@ def merge(ctx, dry_run):
 @click.argument("archive", type=click.Path(exists=True, dir_okay=False, resolve_path=True))
 @click.option("--dest", required=True, type=click.Path(file_okay=False, resolve_path=True),
               help="Destination folder for unique files.")
+@click.option("--allow-unreachable-volumes", is_flag=True,
+              help="Ingest even though indexed files live on a detached volume. "
+                   "Duplicates will be judged against rows that cannot be read.")
 @click.pass_context
-def ingest(ctx, archive, dest):
+def ingest(ctx, archive, dest, allow_unreachable_volumes):
     """Ingest a Takeout zip: extract, dedup, and keep unique files."""
     db = Database(ctx.obj["db_path"])
 
@@ -167,8 +171,13 @@ def ingest(ctx, archive, dest):
     try:
         click.echo(f"Ingesting {archive}")
         click.echo(f"Destination: {dest}")
-        stats = ingest_archive(Path(archive), Path(dest), db, progress_callback=progress)
+        stats = ingest_archive(
+            Path(archive), Path(dest), db, progress_callback=progress,
+            allow_unreachable_volumes=allow_unreachable_volumes,
+        )
         click.echo(f"\nTotal files in database: {db.file_count():,}")
+    except UnreachableVolumeError as e:
+        raise click.ClickException(str(e))
     finally:
         db.close()
 
@@ -188,6 +197,61 @@ def stats(ctx):
         click.echo(f"Duplicate groups:  {len(dupes):,}")
         click.echo(f"Extra copies:      {dupe_files:,}")
         click.echo(f"Wasted space:      {wasted / (1024**3):.1f} GB")
+    finally:
+        db.close()
+
+
+@cli.command()
+@click.option("--yes", is_flag=True, help="Apply without confirmation.")
+@click.pass_context
+def migrate(ctx, yes):
+    """Apply schema migrations and retire unreviewed auto-resolutions.
+
+    Opening the database applies any missing columns. This command then marks
+    every verdict written by the old blanket auto-resolve as stale, so no
+    future apply step can mistake it for a reviewed decision.
+    """
+    db = Database(ctx.obj["db_path"])
+    try:
+        pending = db.conn.execute(
+            "SELECT COUNT(*) c FROM resolutions "
+            "WHERE auto_resolved = 1 AND COALESCE(stale, 0) = 0"
+        ).fetchone()["c"]
+
+        click.echo(f"Schema is up to date ({ctx.obj['db_path']}).")
+        if pending == 0:
+            click.echo("No unreviewed auto-resolutions to retire.")
+            return
+
+        click.echo(f"{pending:,} auto-resolved verdict(s) will be marked stale.")
+        if not yes:
+            click.confirm("Apply?", abort=True)
+
+        marked = mark_auto_resolutions_stale(db)
+        click.echo(f"Marked {marked:,} resolution(s) stale.")
+        click.echo("Those groups are now unresolved again and will reappear for review.")
+    finally:
+        db.close()
+
+
+@cli.command()
+@click.pass_context
+def volumes(ctx):
+    """Report indexed volumes that are not currently attached."""
+    db = Database(ctx.obj["db_path"])
+    try:
+        unreachable = find_unreachable_volumes(db)
+        if not unreachable:
+            click.echo("All indexed volumes are reachable.")
+            return
+
+        total = sum(v["row_count"] for v in unreachable)
+        click.echo(f"{len(unreachable)} unreachable volume(s), {total:,} indexed file(s):\n")
+        for v in unreachable:
+            click.echo(f"  {v['volume']}")
+            click.echo(f"      rows:    {v['row_count']:,}")
+            click.echo(f"      example: {v['sample_path']}")
+        click.echo("\nIngest will refuse to run until these are attached.")
     finally:
         db.close()
 

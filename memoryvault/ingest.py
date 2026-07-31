@@ -5,12 +5,13 @@ from pathlib import Path
 
 from memoryvault.archive import iter_entries, count_entries, extract_entry_to_path, ArchiveEntry
 from memoryvault.database import Database
-from memoryvault.hasher import hash_bytes, hash_full
+from memoryvault.hasher import hash_bytes, hash_full, hash_head, hash_tail
 from memoryvault.metadata import (
     parse_takeout_sidecar, can_have_exif, has_metadata,
     get_exif_date, get_exif_gps,
     write_exif_date, write_exif_gps,
 )
+from memoryvault.volumes import assert_volumes_reachable
 
 # Extensions we consider media files
 MEDIA_EXTENSIONS = {
@@ -49,7 +50,8 @@ def _media_name_for_sidecar(sidecar_path: str) -> str | None:
 
 
 def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
-                   progress_callback=None, title: str = None) -> dict:
+                   progress_callback=None, title: str = None,
+                   allow_unreachable_volumes: bool = False) -> dict:
     """Ingest a Takeout zip: stream files, dedup against DB, keep unique files.
 
     Single-pass streaming approach:
@@ -63,11 +65,23 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
         dest_folder: Where to save unique files.
         db: Database instance.
         progress_callback: Optional callback(stage, **kwargs).
+        allow_unreachable_volumes: Proceed even when indexed files live on a
+            volume that is not attached. Off by default because deduplicating
+            against unreadable rows discards incoming originals.
 
     Returns dict with stats: kept, skipped, errors, merged_metadata.
+
+    Raises:
+        UnreachableVolumeError: an indexed volume is detached and no override
+            was given.
     """
     archive_path = archive_path.resolve()
     dest_folder = dest_folder.resolve()
+
+    # Checked before any bytes are written, so an aborted run changes nothing.
+    if not allow_unreachable_volumes:
+        assert_volumes_reachable(db, override_hint="--allow-unreachable-volumes")
+
     dest_folder.mkdir(parents=True, exist_ok=True)
 
     # Register archive and check for resume
@@ -146,7 +160,13 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
             continue
 
         # Process media file immediately — no buffering
-        result = _process_media_entry(entry, dest_folder, db, sidecars, archive_id)
+        try:
+            result = _process_media_entry(entry, dest_folder, db, sidecars, archive_id)
+        except Exception as e:
+            db.log_archive_entry(archive_id, entry.path, "error", skip_reason=str(e)[:200])
+            stats["errors"] += 1
+            processed_count += 1
+            continue
         stats[result["action"]] += 1
         if result.get("merged"):
             stats["merged_metadata"] += len(result["merged"])
@@ -247,6 +267,10 @@ def _apply_sidecar_to_file(dest_path: str, sidecar: dict, source_desc: str,
         except Exception:
             pass
 
+    if merged:
+        # The file's bytes just changed; its row must follow.
+        _index_saved_file(db, path)
+
     return merged
 
 
@@ -267,36 +291,35 @@ def _process_media_entry_inner(entry: ArchiveEntry, dest_folder: Path, db: Datab
                                sidecars: dict, archive_id: int) -> dict:
     size = entry.size
 
-    # Hash the file — from disk for large files, from memory for small
+    # Hash the source bytes — from disk for large files, from memory for small.
+    # This is the entry's identity as it came out of the archive, and is stored
+    # as source_blake3; it is NOT necessarily the hash of what we write, because
+    # metadata may be embedded into the saved copy afterwards.
     if entry.is_large:
-        full_hash = hash_full(entry.temp_path)
+        source_hash = hash_full(entry.temp_path)
     else:
-        full_hash = hash_bytes(entry.data)
+        source_hash = hash_bytes(entry.data)
 
-    # Check if we already have this exact file
-    existing = db.get_files_by_full_hash(full_hash)
-    if existing:
-        merged = _try_merge_from_duplicate(entry, existing[0], sidecars, db)
+    # A skip is only safe if the copy we would keep still exists. Rows can
+    # outlive their files: a deleted vault, a reorganised folder, or a detached
+    # drive all leave the index claiming ownership of bytes nobody can read.
+    candidates = db.find_files_by_content_hash(source_hash)
+    surviving = [c for c in candidates if Path(c["path"]).exists()]
+
+    if surviving:
+        merged = _try_merge_from_duplicate(entry, surviving[0], sidecars, db)
         db.log_archive_entry(archive_id, entry.path, "skipped", skip_reason="duplicate")
         return {"action": "skipped", "merged": merged}
 
-    # Progressive check: same size files
-    same_size = db.get_files_by_size(size)
-    if same_size:
-        if entry.is_large:
-            from memoryvault.hasher import hash_head
-            head_hash = hash_head(entry.temp_path)
-        else:
-            head_hash = hash_bytes(entry.data[:65_536])
+    # Matched the index but every copy is gone — treat as new and record why,
+    # so the decision is queryable rather than silent.
+    keep_reason = "prior_copy_missing" if candidates else None
 
-        for existing_file in same_size:
-            if existing_file.get("blake3_head") == head_hash:
-                if existing_file.get("blake3_full") == full_hash:
-                    merged = _try_merge_from_duplicate(
-                        entry, existing_file, sidecars, db)
-                    db.log_archive_entry(archive_id, entry.path, "skipped",
-                                         skip_reason="duplicate")
-                    return {"action": "skipped", "merged": merged}
+    # NOTE: the old same-size/head-hash probe that ran here was removed with
+    # finding #11. It ended by comparing blake3_full to the incoming hash, which
+    # find_files_by_content_hash already covers, so it could not match anything
+    # new — and its head-hash comparison read a column that drifts once EXIF is
+    # written into a saved file.
 
     # New file — save it
     filename = Path(entry.path).name
@@ -330,31 +353,48 @@ def _process_media_entry_inner(entry: ArchiveEntry, dest_folder: Path, db: Datab
             except Exception:
                 pass
 
-    # Compute head/tail hashes for DB — use the saved file on disk
-    from memoryvault.hasher import hash_head, hash_tail
-    head_hash = hash_head(dest_path)
-    tail_hash = hash_tail(dest_path) if size > 4_096 else head_hash
+    # Index the file as it now stands on disk. Metadata writes above changed
+    # both its size and its bytes, so every hash must be taken after them.
+    _index_saved_file(db, dest_path, source_hash=source_hash, source="takeout")
 
-    # Check metadata on the saved file
-    meta = has_metadata(dest_path) if can_have_exif(dest_path) else {
-        "has_exif_date": False, "has_exif_gps": False
+    db.log_archive_entry(archive_id, entry.path, "kept", kept_path=str(dest_path),
+                         skip_reason=keep_reason)
+    return {"action": "kept", "merged": merged, "dest_path": str(dest_path)}
+
+
+def _index_saved_file(db: Database, path: Path, source_hash: str | None = None,
+                      source: str | None = None):
+    """Record a saved file's hashes from its current on-disk bytes.
+
+    Called after every write that can change the file, so `blake3_full`,
+    `blake3_head`, `blake3_tail` and `size` always describe what is actually
+    on disk. `source_blake3` is only written when supplied, so refreshing an
+    existing row preserves the provenance recorded at ingest time.
+    """
+    stat = path.stat()
+    size = stat.st_size
+
+    fields = {
+        "path": str(path),
+        "size": size,
+        "blake3_full": hash_full(path),
+        "blake3_head": hash_head(path),
+        "blake3_tail": hash_tail(path) if size > 4_096 else hash_head(path),
+        "mtime": stat.st_mtime,
     }
 
-    # Add to database
-    db.upsert_file(
-        path=str(dest_path),
-        size=size,
-        blake3_full=full_hash,
-        blake3_head=head_hash,
-        blake3_tail=tail_hash,
-        mtime=dest_path.stat().st_mtime,
-        has_exif_date=meta["has_exif_date"],
-        has_exif_gps=meta["has_exif_gps"],
-        source="takeout",
-    )
+    meta = has_metadata(path) if can_have_exif(path) else {
+        "has_exif_date": False, "has_exif_gps": False
+    }
+    fields["has_exif_date"] = meta["has_exif_date"]
+    fields["has_exif_gps"] = meta["has_exif_gps"]
 
-    db.log_archive_entry(archive_id, entry.path, "kept", kept_path=str(dest_path))
-    return {"action": "kept", "merged": merged, "dest_path": str(dest_path)}
+    if source_hash is not None:
+        fields["source_blake3"] = source_hash
+    if source is not None:
+        fields["source"] = source
+
+    db.upsert_file(**fields)
 
 
 def _try_merge_from_duplicate(entry: ArchiveEntry, existing: dict,
@@ -414,6 +454,10 @@ def _try_merge_from_duplicate(entry: ArchiveEntry, existing: dict,
                     tmp_path.unlink()
                 except OSError:
                     pass
+
+    if merged:
+        # Metadata was written into the kept file, changing its bytes and size.
+        _index_saved_file(db, existing_path)
 
     return merged
 

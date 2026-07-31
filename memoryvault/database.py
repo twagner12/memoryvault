@@ -15,6 +15,10 @@ CREATE TABLE IF NOT EXISTS files (
     blake3_full TEXT,
     blake3_head TEXT,
     blake3_tail TEXT,
+    -- Hash of the bytes as they arrived from the source, before any metadata
+    -- was written into the saved file. blake3_full always describes the file
+    -- currently on disk; source_blake3 preserves archive-entry provenance.
+    source_blake3 TEXT,
     mtime REAL,
     has_exif_date BOOLEAN,
     has_exif_gps BOOLEAN,
@@ -63,14 +67,50 @@ CREATE TABLE IF NOT EXISTS resolutions (
     action TEXT NOT NULL,
     confidence INTEGER DEFAULT 100,
     resolved_at TEXT NOT NULL,
-    auto_resolved BOOLEAN DEFAULT FALSE
+    auto_resolved BOOLEAN DEFAULT FALSE,
+    -- Set on verdicts produced by the old blanket auto-resolve, which ran with
+    -- no human review and a scorer whose resolution term was inert. A stale
+    -- row is history, not a decision: is_resolved() ignores it.
+    stale INTEGER DEFAULT 0
 );
 
+"""
+
+# Applied after column migrations: on an older database the columns these
+# index may not exist until the migration has run.
+SCHEMA_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_files_blake3_full ON files(blake3_full);
 CREATE INDEX IF NOT EXISTS idx_files_size ON files(size);
 CREATE INDEX IF NOT EXISTS idx_files_blake3_head ON files(blake3_head);
+CREATE INDEX IF NOT EXISTS idx_files_source_blake3 ON files(source_blake3);
+CREATE INDEX IF NOT EXISTS idx_files_path_stat ON files(path, size, mtime);
 CREATE INDEX IF NOT EXISTS idx_resolutions_blake3 ON resolutions(blake3_full);
 """
+
+# Columns added after the initial release. Applied by comparing against
+# PRAGMA table_info rather than catching errors from a blind ALTER, so the
+# migration is idempotent by construction and never swallows a real failure.
+MIGRATIONS: dict[str, dict[str, str]] = {
+    "files": {
+        "blake3_head": "TEXT",
+        "blake3_tail": "TEXT",
+        "source_blake3": "TEXT",
+        "mtime": "REAL",
+        "has_exif_date": "BOOLEAN",
+        "has_exif_gps": "BOOLEAN",
+        "width": "INTEGER",
+        "height": "INTEGER",
+        "source": "TEXT",
+    },
+    "archives": {
+        "completed_at": "TEXT",
+        "title": "TEXT",
+    },
+    "resolutions": {
+        "confidence": "INTEGER DEFAULT 100",
+        "stale": "INTEGER DEFAULT 0",
+    },
+}
 
 
 class Database:
@@ -84,13 +124,28 @@ class Database:
 
     def _init_schema(self):
         self.conn.executescript(SCHEMA)
-        # Migrations for existing databases
-        for col in ["completed_at TEXT", "title TEXT"]:
-            try:
-                self.conn.execute(f"ALTER TABLE archives ADD COLUMN {col}")
-            except Exception:
-                pass
+        self._apply_column_migrations()
+        self.conn.executescript(SCHEMA_INDEXES)
         self.conn.commit()
+
+    def _apply_column_migrations(self):
+        """Add any columns missing from an older database.
+
+        Idempotent: existing columns are detected via PRAGMA table_info and
+        skipped, so no ALTER is issued that we expect to fail.
+        """
+        for table, columns in MIGRATIONS.items():
+            existing = {
+                row["name"]
+                for row in self.conn.execute(f"PRAGMA table_info({table})")
+            }
+            if not existing:
+                continue  # table absent entirely; CREATE above owns it
+            for name, definition in columns.items():
+                if name not in existing:
+                    self.conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                    )
 
     def close(self):
         self.conn.close()
@@ -155,6 +210,19 @@ class Database:
     def get_files_by_full_hash(self, blake3_full: str) -> list[dict]:
         rows = self.conn.execute(
             "SELECT * FROM files WHERE blake3_full = ?", (blake3_full,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_files_by_content_hash(self, content_hash: str) -> list[dict]:
+        """Find files matching `content_hash` as either their on-disk or source bytes.
+
+        Ingest writes metadata into a file after saving it, so the same original
+        photo arriving in a later archive hashes to the *source* value while the
+        saved copy on disk hashes to something else. Both must match.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM files WHERE blake3_full = ? OR source_blake3 = ?",
+            (content_hash, content_hash),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -255,14 +323,35 @@ class Database:
         self.conn.commit()
 
     def is_resolved(self, blake3_full: str) -> bool:
+        """True only for verdicts that still count. Stale rows do not."""
         row = self.conn.execute(
-            "SELECT 1 FROM resolutions WHERE blake3_full = ?", (blake3_full,)
+            "SELECT 1 FROM resolutions WHERE blake3_full = ? AND COALESCE(stale, 0) = 0",
+            (blake3_full,),
         ).fetchone()
         return row is not None
 
     def get_resolved_hashes(self) -> set[str]:
-        rows = self.conn.execute("SELECT blake3_full FROM resolutions").fetchall()
+        rows = self.conn.execute(
+            "SELECT blake3_full FROM resolutions WHERE COALESCE(stale, 0) = 0"
+        ).fetchall()
         return {r["blake3_full"] for r in rows}
+
+    def get_stat_index(self, prefix: str) -> dict[str, tuple[int, float]]:
+        """Map path -> (size, mtime) for every indexed file under `prefix`.
+
+        Loaded in one query so a rescan can skip unchanged files without
+        issuing a lookup per file. The range comparison uses the existing
+        UNIQUE(path) index; LIKE would not.
+        """
+        rows = self.conn.execute(
+            "SELECT path, size, mtime FROM files WHERE path >= ? AND path < ?",
+            (prefix, prefix + "￿"),
+        ).fetchall()
+        return {
+            r["path"]: (r["size"], r["mtime"])
+            for r in rows
+            if r["mtime"] is not None
+        }
 
     def find_unresolved_duplicate_groups(self) -> list[list[dict]]:
         """Find duplicate groups that haven't been resolved yet."""
@@ -273,7 +362,34 @@ class Database:
     def get_resolution_stats(self) -> dict:
         row = self.conn.execute(
             "SELECT COUNT(*) as total, "
-            "SUM(CASE WHEN auto_resolved THEN 1 ELSE 0 END) as auto_count "
-            "FROM resolutions"
+            "SUM(CASE WHEN auto_resolved THEN 1 ELSE 0 END) as auto_count, "
+            "SUM(CASE WHEN COALESCE(stale, 0) = 1 THEN 1 ELSE 0 END) as stale_count "
+            "FROM resolutions WHERE COALESCE(stale, 0) = 0"
         ).fetchone()
-        return {"total": row["total"], "auto_resolved": row["auto_count"]}
+        stale = self.conn.execute(
+            "SELECT COUNT(*) as c FROM resolutions WHERE COALESCE(stale, 0) = 1"
+        ).fetchone()["c"]
+        return {
+            "total": row["total"],
+            "auto_resolved": row["auto_count"] or 0,
+            "stale": stale,
+        }
+
+
+def mark_auto_resolutions_stale(db: Database) -> int:
+    """Invalidate every machine-made verdict from the old blanket auto-resolve.
+
+    Those rows were written for *all* duplicate groups at confidence=100 with no
+    human review, chosen by a scorer whose resolution term was inert (width and
+    height are NULL for every row) and whose format ranking trusts a file
+    extension that is often wrong. They are kept for history but must never be
+    read as reviewed decisions.
+
+    Returns the number of rows newly marked. Idempotent: re-running marks none.
+    """
+    cursor = db.conn.execute(
+        "UPDATE resolutions SET stale = 1 "
+        "WHERE auto_resolved = 1 AND COALESCE(stale, 0) = 0"
+    )
+    db.conn.commit()
+    return cursor.rowcount

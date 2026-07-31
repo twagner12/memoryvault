@@ -19,7 +19,11 @@ def scan_folder(folder: Path, db: Database, source: str = "local",
                 progress_callback=None) -> int:
     """Scan a folder, hash all files progressively, and store in the database.
 
-    Returns the number of files scanned.
+    Files whose size and mtime match their existing row are skipped without
+    being re-hashed; the progress callback reports how many via a
+    "skipped_unchanged" stage.
+
+    Returns the number of files scanned, including skipped ones.
     """
     folder = folder.resolve()
 
@@ -32,11 +36,26 @@ def scan_folder(folder: Path, db: Database, source: str = "local",
     if progress_callback:
         progress_callback("start", total, 0)
 
+    # Files whose size and mtime still match their row have not changed, so
+    # re-reading them would produce the hashes we already hold. Loaded once
+    # rather than queried per file.
+    known = db.get_stat_index(str(folder))
+
     batch = []
     scanned = 0
+    skipped_unchanged = 0
 
     for i, path in enumerate(files):
         try:
+            stat = path.stat()
+            previous = known.get(str(path))
+            if previous is not None and previous == (stat.st_size, stat.st_mtime):
+                skipped_unchanged += 1
+                scanned += 1
+                if progress_callback and scanned % 100 == 0:
+                    progress_callback("progress", total, scanned)
+                continue
+
             info = hash_file_progressive(path)
             info["source"] = source
             meta = has_metadata(path)
@@ -60,6 +79,9 @@ def scan_folder(folder: Path, db: Database, source: str = "local",
         db.bulk_upsert_files(batch)
 
     if progress_callback:
+        # Emitted as its own stage so the count of short-circuited files is
+        # visible rather than hidden inside the scanned total.
+        progress_callback("skipped_unchanged", total, skipped_unchanged)
         progress_callback("done", total, scanned)
 
     return scanned
