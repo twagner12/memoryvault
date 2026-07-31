@@ -247,6 +247,51 @@ class TestSidecarAppliedExactlyOnce:
 
         assert sorted(logs) == ["date", "gps"]
 
+    def test_duplicate_entry_does_not_re_date_the_survivor(self, tmp_path, db,
+                                                           make_zip, small_mp4):
+        """A deduped copy contributing its own sidecar must not re-apply.
+
+        Two byte-identical videos, each with its own sidecar. The second is
+        skipped as a duplicate, and `_try_merge_from_duplicate` offers its
+        sidecar to the surviving copy — which already has the date. The EXIF
+        paths are guarded by `get_exif_date`; the mtime path had no
+        equivalent, so the survivor collected a second `merged_mtime_only`
+        row and a second deferred value.
+
+        Live-DB relevance: 51,863 entries are already skipped as duplicates,
+        and archives 2 and 3 are literally the same zip.
+        """
+        ingest_archive(make_zip({
+            "T/P/clip.mp4": small_mp4.read_bytes(),
+            "T/P/clip.mp4.supplemental-metadata.json": make_sidecar_bytes(TS),
+            "T/P/dupe.mp4.supplemental-metadata.json": make_sidecar_bytes(TS),
+            "T/P/dupe.mp4": small_mp4.read_bytes(),
+        }), tmp_path / "vault", db, allow_unreachable_volumes=True)
+
+        survivor = str(tmp_path / "vault" / "clip.mp4")
+        logs = [r["field"] for r in db.conn.execute(
+            "SELECT field FROM metadata_log WHERE target_path = ?",
+            (survivor,)).fetchall()]
+
+        assert logs == ["merged_mtime_only"]
+        assert len(db.get_pending(survivor)) == 1
+
+    def test_duplicate_entry_with_a_jpeg_survivor(self, tmp_path, db, make_zip):
+        """The EXIF path already had this guard; pin it so it stays."""
+        ingest_archive(make_zip({
+            "T/P/a.jpg": make_jpeg_bytes(color="red"),
+            "T/P/a.jpg.supplemental-metadata.json": make_sidecar_bytes(TS),
+            "T/P/b.jpg.supplemental-metadata.json": make_sidecar_bytes(TS),
+            "T/P/b.jpg": make_jpeg_bytes(color="red"),
+        }), tmp_path / "vault", db, allow_unreachable_volumes=True)
+
+        survivor = str(tmp_path / "vault" / "a.jpg")
+        logs = [r["field"] for r in db.conn.execute(
+            "SELECT field FROM metadata_log WHERE target_path = ?",
+            (survivor,)).fetchall()]
+
+        assert logs.count("date") == 1
+
     def test_sidecar_counted_once_in_stats(self, tmp_path, db, make_zip,
                                            small_mp4):
         stats = ingest_archive(

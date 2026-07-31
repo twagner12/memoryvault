@@ -24,6 +24,7 @@ Anything else — above all a silent zero, present in neither table — is a bug
 
 import json
 import os
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -253,17 +254,24 @@ LEGAL_DUAL = {
 }
 
 
-def _outcome_states(db, file_path: str, field: str) -> set:
-    """Every table state recorded for one (file, field) pair."""
-    states = set()
+def _outcome_states(db, file_path: str, field: str) -> Counter:
+    """How many times each table state was recorded for one (file, field).
+
+    A Counter, not a set. Folding these into a set is what let the
+    double-apply bug through: a sidecar applied twice wrote two identical
+    `merged_mtime_only` rows and two identical `deferred` rows, which
+    collapsed to exactly the same one-of-each shape a correct single apply
+    produces. Presence was never the whole invariant — cardinality is.
+    """
+    counts: Counter = Counter()
 
     for row in db.conn.execute(
         "SELECT field FROM metadata_log WHERE target_path = ?", (file_path,)
     ).fetchall():
         if row["field"] == field:
-            states.add(("log", "merged"))
+            counts[("log", "merged")] += 1
         elif row["field"] == "merged_mtime_only" and field == "date":
-            states.add(("log", "merged_mtime_only"))
+            counts[("log", "merged_mtime_only")] += 1
 
     for row in db.conn.execute(
         "SELECT field, state, reason FROM metadata_pending WHERE file_path = ?",
@@ -272,31 +280,153 @@ def _outcome_states(db, file_path: str, field: str) -> set:
         if row["field"] != field:
             continue
         if row["reason"] == "tz_unknown_assumed_utc":
-            states.add(("pending", "tz_unknown_assumed_utc"))
+            counts[("pending", "tz_unknown_assumed_utc")] += 1
         else:
-            states.add(("pending", row["state"]))
+            counts[("pending", row["state"])] += 1
 
-    return states
+    return counts
 
 
-def assert_legal(states: set, file_path: str, field: str, already_present: bool):
-    """The whole invariant, in one place."""
+def assert_legal(counts: Counter, file_path: str, field: str,
+                 already_present: bool):
+    """The whole invariant, in one place.
+
+    Three separate claims, each with its own failure message:
+      - already-present fields record nothing
+      - a field the sidecar carried records *something* (no silent zero)
+      - each state is recorded exactly once, and the combination is legal
+    """
+    name = Path(file_path).name
+
     if already_present:
-        assert not states, (
-            f"{Path(file_path).name}/{field}: already had this field, so "
-            f"nothing should have been recorded, got {states}")
+        assert not counts, (
+            f"{name}/{field}: already had this field, so nothing should have "
+            f"been recorded, got {dict(counts)}")
         return
 
-    assert states, (
-        f"{Path(file_path).name}/{field}: SILENT ZERO — the sidecar carried "
-        f"this field and no row records what happened to it")
+    assert counts, (
+        f"{name}/{field}: SILENT ZERO — the sidecar carried this field and no "
+        f"row records what happened to it")
 
-    if len(states) == 1:
+    repeated = {state: n for state, n in counts.items() if n > 1}
+    assert not repeated, (
+        f"{name}/{field}: DUPLICATE OUTCOME — "
+        + ", ".join(f"{state} recorded {n}×" for state, n in repeated.items())
+        + ". Each state must be recorded exactly once; a repeat means the "
+          "value was applied more than once and a drain pass would re-apply it."
+    )
+
+    if len(counts) == 1:
         return
 
-    assert frozenset(states) in LEGAL_DUAL, (
-        f"{Path(file_path).name}/{field}: illegal dual-table combination "
-        f"{states}; only {LEGAL_DUAL} are permitted")
+    assert frozenset(counts) in LEGAL_DUAL, (
+        f"{name}/{field}: illegal dual-table combination "
+        f"{set(counts)}; only {LEGAL_DUAL} are permitted")
+
+
+def _legacy_set_view(counts: Counter) -> set:
+    """The old set-based collapse, kept only to prove the blind spot was real.
+
+    This is exactly what `_outcome_states` used to return. It exists so the
+    tests below can demonstrate that the previous invariant accepted a
+    double-applied value, rather than merely asserting that it did.
+    """
+    return set(counts)
+
+
+class TestInvariantCatchesDuplicateRows:
+    """The tightened check must reject what the set-based one waved through.
+
+    Models the real double-apply bug: a sidecar that arrived before its media
+    was consumed by the media entry *and* re-applied by the rebind post-pass,
+    so a video logged two `merged_mtime_only` rows and two `deferred` rows.
+    """
+
+    @pytest.fixture
+    def double_applied_video(self, tmp_path, db, small_mp4):
+        """One correct apply, plus the extra rows a double apply left behind.
+
+        The rows are planted directly rather than by calling `apply_sidecar`
+        twice, because the pipeline no longer permits a double apply. The
+        checker has to be demonstrable on its own — a guard test that depends
+        on the bug still existing stops working the moment it is fixed.
+        """
+        apply_sidecar(small_mp4, sidecar(), db, "takeout:v.mp4")
+
+        payload = json.dumps({"utc_epoch": CHICAGO_UTC, "offset": "+00:00",
+                              "tz_source": "utc_fallback"})
+        db.log_metadata_merge(str(small_mp4), "takeout:v.mp4",
+                              "merged_mtime_only", payload)
+        db.record_pending(str(small_mp4), "date", payload, "unsupported_mp4",
+                          "deferred", source_desc="takeout:v.mp4")
+        return small_mp4
+
+    def test_setup_really_produced_duplicates(self, double_applied_video, db):
+        """Guard the fixture: without duplicates the rest proves nothing."""
+        counts = _outcome_states(db, str(double_applied_video), "date")
+
+        assert counts[("log", "merged_mtime_only")] == 2
+        assert counts[("pending", "deferred")] == 2
+
+    def test_tightened_check_rejects_it(self, double_applied_video, db):
+        counts = _outcome_states(db, str(double_applied_video), "date")
+
+        with pytest.raises(AssertionError, match="DUPLICATE OUTCOME"):
+            assert_legal(counts, str(double_applied_video), "date",
+                         already_present=False)
+
+    def test_the_old_set_based_check_would_have_passed(self,
+                                                       double_applied_video, db):
+        """The blind spot, demonstrated rather than asserted.
+
+        Collapsed to a set, a double apply is indistinguishable from the
+        legal `merged_mtime_only + deferred` pair — which is precisely why
+        the bug survived the original invariant test.
+        """
+        counts = _outcome_states(db, str(double_applied_video), "date")
+        legacy = _legacy_set_view(counts)
+
+        assert frozenset(legacy) in LEGAL_DUAL
+        assert len(legacy) == 2
+
+    def test_duplicate_merged_row_alone_is_rejected(self, tmp_path, db):
+        """A plain JPEG date written twice — one table, still a duplicate."""
+        path = tmp_path / "p.jpg"
+        path.write_bytes(make_jpeg_bytes())
+        apply_sidecar(path, sidecar(**CHICAGO), db, "takeout:p.jpg")
+        # A second identical log row, as a re-apply would leave behind.
+        db.log_metadata_merge(str(path), "takeout:p.jpg", "date", "{}")
+
+        counts = _outcome_states(db, str(path), "date")
+
+        assert counts[("log", "merged")] == 2
+        with pytest.raises(AssertionError, match="DUPLICATE OUTCOME"):
+            assert_legal(counts, str(path), "date", already_present=False)
+
+    def test_duplicate_pending_row_alone_is_rejected(self, tmp_path, db,
+                                                     genuine_heic):
+        """Two deferred rows would make a drain pass apply the value twice."""
+        apply_sidecar(genuine_heic, sidecar(utc_epoch=None, lat=41.9, lon=-87.6),
+                      db, "takeout:x.heic")
+        db.record_pending(str(genuine_heic), "gps", "{}", "unsupported_heif",
+                          "deferred", source_desc="takeout:x.heic")
+
+        counts = _outcome_states(db, str(genuine_heic), "gps")
+
+        assert counts[("pending", "deferred")] == 2
+        with pytest.raises(AssertionError, match="DUPLICATE OUTCOME"):
+            assert_legal(counts, str(genuine_heic), "gps",
+                         already_present=False)
+
+    def test_a_correct_single_apply_still_passes(self, tmp_path, db, small_mp4):
+        """No false positive: the legal dual state is one of each."""
+        apply_sidecar(small_mp4, sidecar(), db, "takeout:v.mp4")
+
+        counts = _outcome_states(db, str(small_mp4), "date")
+
+        assert counts[("log", "merged_mtime_only")] == 1
+        assert counts[("pending", "deferred")] == 1
+        assert_legal(counts, str(small_mp4), "date", already_present=False)
 
 
 class TestInvariantAcrossAMixedArchive:
@@ -304,7 +434,7 @@ class TestInvariantAcrossAMixedArchive:
 
     @pytest.fixture
     def ingested(self, tmp_path, db, make_zip, genuine_heic,
-                 jpeg_named_heic_undated, small_mp4):
+                 jpeg_named_heic_undated, small_mp4, second_mp4):
         entries = {
             # plain JPEG with GPS in the sidecar → both fields merge normally
             "Takeout/Photos/plain.jpg": make_jpeg_bytes(color="red"),
@@ -331,6 +461,14 @@ class TestInvariantAcrossAMixedArchive:
             "Takeout/Photos/clip.mp4.supplemental-metadata.json":
                 make_sidecar_bytes(CHICAGO_UTC),
 
+            # The same shape with the sidecar AHEAD of its media — the
+            # ordering that produced the double-apply. Every other pair here
+            # is media-first, so without this the tightened cardinality check
+            # would never be pointed at the path that had the bug.
+            "Takeout/Photos/early.mp4.supplemental-metadata.json":
+                make_sidecar_bytes(CHICAGO_UTC),
+            "Takeout/Photos/early.mp4": second_mp4.read_bytes(),
+
             # truncated suffix + counter → exercises the new matcher
             "Takeout/Photos/DSC_0109(9).JPG": make_jpeg_bytes(color="yellow"),
             "Takeout/Photos/DSC_0109.JPG.supplemental-meta(9).json":
@@ -351,6 +489,7 @@ class TestInvariantAcrossAMixedArchive:
             "real.heic": {"date", "gps"},
             "fake.heic": {"date", "gps"},
             "clip.mp4": {"date"},
+            "early.mp4": {"date"},
             "DSC_0109(9).JPG": {"date", "gps"},
         }
 
@@ -363,9 +502,9 @@ class TestInvariantAcrossAMixedArchive:
                 assert_legal(states, str(path), field, already_present=False)
                 checked += 1
 
-        # 2 + 1 + 2 + 2 + 1 + 2 — pinned so a fixture that silently stops
+        # 2 + 1 + 2 + 2 + 1 + 1 + 2 — pinned so a fixture that silently stops
         # being ingested cannot quietly shrink the invariant's coverage.
-        assert checked == 10
+        assert checked == 11
 
     def test_no_sidecar_went_unmatched(self, ingested, db):
         """Every sidecar in this archive is nameable by the new matcher."""

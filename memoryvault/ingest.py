@@ -625,6 +625,17 @@ def _apply_date_as_mtime(path: Path, utc_epoch: int, capture, db: Database,
     dependency, so it is set — and the real value is still recorded as
     outstanding, because an mtime is a weaker claim than embedded metadata.
     """
+    # The EXIF paths refuse to overwrite a date the file already carries, via
+    # `get_exif_date`. A container that can only hold an mtime needs the same
+    # guard, and its mtime *is* the stored value — without this, any second
+    # offer of the same date logs a duplicate `merged_mtime_only` row and a
+    # duplicate deferred value. That happens whenever a byte-identical copy
+    # arrives with its own sidecar, which the corpus does constantly: 51,863
+    # entries are already skipped as duplicates.
+    if int(path.stat().st_mtime) == int(utc_epoch):
+        outcome.already_present.append("date")
+        return
+
     payload = _date_payload(capture, utc_epoch)
 
     # utc_epoch, not the local wall clock: mtime is an absolute instant.

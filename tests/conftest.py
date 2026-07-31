@@ -33,6 +33,10 @@ CORPUS = Path("/home/tim/Pictures/Test_folder_files")
 GENUINE_HEIC = CORPUS / "lp_image(2).heic"
 JPEG_NAMED_HEIC = CORPUS / "IMG_1671.heic"
 SMALL_MP4 = CORPUS / "92532505-c63f-4376-96b6-a5872a7ef752.mp4"
+#   IMG_5285.MOV     290 KB  ftyp:mp42  — a *different* video, so a test
+#                                         needing two videos does not
+#                                         accidentally test deduplication
+SECOND_MP4 = CORPUS / "IMG_5285.MOV"
 
 
 def _corpus_copy(src: Path, dest_dir: Path, name: str | None = None) -> Path:
@@ -150,6 +154,12 @@ def jpeg_named_heic_undated(tmp_path) -> Path:
 def small_mp4(tmp_path) -> Path:
     """A real mp4 — no EXIF container, so date can only reach it via mtime."""
     return _corpus_copy(SMALL_MP4, tmp_path)
+
+
+@pytest.fixture
+def second_mp4(tmp_path) -> Path:
+    """A second real video whose bytes differ from `small_mp4`."""
+    return _corpus_copy(SECOND_MP4, dest_dir=tmp_path)
 
 
 @pytest.fixture
