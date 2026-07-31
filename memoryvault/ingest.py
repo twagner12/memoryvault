@@ -24,7 +24,7 @@ from memoryvault.metadata import (
 )
 from memoryvault.phototime import resolve_capture_time
 from memoryvault.sidecar_names import (
-    UnmatchedReason, is_sidecar_name, resolve_media_name,
+    UnmatchedReason, is_sidecar_name, resolve_media_name, split_sidecar_name,
 )
 from memoryvault.volumes import assert_volumes_reachable
 
@@ -119,6 +119,10 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
     # Every sidecar seen, so the post-pass can retry the ones that did not
     # bind while streaming and record whatever is still left over.
     seen_sidecars: list[dict] = []
+    # The same records, reachable by candidate name. A media entry consuming
+    # a sidecar marks it bound here, which is what stops the post-pass from
+    # applying it a second time.
+    records_by_candidate: dict[str, dict] = {}
     # Media filenames per directory within the archive, built as we stream.
     # The fuzzy tier needs a directory's full listing, which only exists once
     # the archive has been walked — hence the post-pass.
@@ -147,14 +151,30 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
 
         if is_sidecar_json(entry.path):
             record = _read_sidecar_entry(entry)
-            if record is not None:
-                seen_sidecars.append(record)
-                # Register under every name shape this sidecar could belong
-                # to, so a media entry arriving later finds it by its own path.
-                for candidate in record["candidates"]:
-                    sidecars.setdefault(candidate, record["parsed"])
 
-                # The media file may already have been processed.
+            if record is None:
+                # The JSON never parsed, so there is no payload to rebind
+                # from — but the sidecar existed, and saying so is the whole
+                # point of #6. Recorded with whatever the name yielded.
+                _record_unreadable_sidecar(db, archive_id, entry.path)
+                stats["sidecars_unmatched"] += 1
+                db.log_archive_entry(archive_id, entry.path, "skipped",
+                                     skip_reason="sidecar")
+                stats["skipped"] += 1
+                processed_count += 1
+                continue
+
+            seen_sidecars.append(record)
+            # Register under every name shape this sidecar could belong to,
+            # so a media entry arriving later finds it by its own path.
+            for candidate in record["candidates"]:
+                if candidate not in sidecars:
+                    sidecars[candidate] = record["parsed"]
+                    records_by_candidate[candidate] = record
+
+            # The media file may already have been processed.
+            failure = None
+            try:
                 for candidate in record["candidates"]:
                     dest = media_dest.get(candidate)
                     if dest:
@@ -163,9 +183,20 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
                         _tally(stats, outcome)
                         record["bound"] = True
                         break
+            except Exception as e:
+                # Same boundary the media path uses: one bad sidecar is an
+                # entry-level error, not the end of the run.
+                failure = str(e)[:200]
+                record["failed"] = True
 
-            db.log_archive_entry(archive_id, entry.path, "skipped", skip_reason="sidecar")
-            stats["skipped"] += 1
+            if failure is not None:
+                db.log_archive_entry(archive_id, entry.path, "error",
+                                     skip_reason=failure)
+                stats["errors"] += 1
+            else:
+                db.log_archive_entry(archive_id, entry.path, "skipped",
+                                     skip_reason="sidecar")
+                stats["skipped"] += 1
             processed_count += 1
             continue
 
@@ -191,6 +222,15 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
             _tally(stats, result["outcome"])
         if result.get("dest_path"):
             media_dest[entry.path] = result["dest_path"]
+        if result.get("sidecar_applied"):
+            # This entry consumed a buffered sidecar, so the post-pass must
+            # not re-resolve and re-apply it. Harmless for a JPEG, whose date
+            # would then already be present, but a container that can only
+            # take the mtime has no such guard and would log a second
+            # merged_mtime_only row and a second deferred value.
+            consumed = records_by_candidate.get(entry.path)
+            if consumed is not None:
+                consumed["bound"] = True
 
         processed_count += 1
 
@@ -291,40 +331,83 @@ def _resolve_leftover_sidecars(db: Database, archive_id: int,
     indistinguishable from success.
     """
     for record in seen_sidecars:
+        if record.get("failed"):
+            # Already recorded as an error against its entry while streaming.
+            continue
         if record["bound"]:
             stats["sidecars_matched"] += 1
             continue
 
-        listing = dir_media.get(record["directory"], [])
-        resolved = resolve_media_name(record["entry_name"], candidates=listing)
+        try:
+            _rebind_one_sidecar(db, archive_id, record, dir_media, media_dest,
+                                stats)
+        except Exception as e:
+            # Per record, so one bad sidecar cannot strand the archive at
+            # 'in_progress'. Only a failure of the pass itself escapes.
+            db.log_archive_entry(archive_id, record["entry_path"], "error",
+                                 skip_reason=str(e)[:200])
+            # It was tallied as skipped when it streamed past; its status has
+            # just changed, so the kept+skipped+errors total still reconciles.
+            stats["skipped"] -= 1
+            stats["errors"] += 1
 
-        dest = None
-        if resolved.media_name:
-            dest = media_dest.get(f"{record['directory']}/{resolved.media_name}")
 
-        if dest:
-            outcome = _apply_sidecar_to_file(dest, record["parsed"],
-                                             record["entry_path"], db)
-            _tally(stats, outcome)
-            stats["sidecars_matched"] += 1
-            continue
+def _rebind_one_sidecar(db: Database, archive_id: int, record: dict,
+                        dir_media: dict[str, list[str]],
+                        media_dest: dict[str, str], stats: dict):
+    """Resolve one leftover sidecar against its directory, or record it."""
+    listing = dir_media.get(record["directory"], [])
+    resolved = resolve_media_name(record["entry_name"], candidates=listing)
 
-        # Either no media name could be derived, or the media it names was
-        # never kept (already a duplicate elsewhere, or absent from the zip).
-        reason = resolved.reason or UnmatchedReason.NO_MEDIA_IN_DIR
-        parts = record["name_parts"]
-        db.record_unmatched_sidecar(
-            archive_id=archive_id,
-            sidecar_path=record["entry_path"],
-            archive_dir=record["directory"],
-            entry_name=record["entry_name"],
-            media_stem=parts.media_name,
-            counter=parts.counter,
-            reason=reason.value,
-            candidate_count=resolved.candidate_count,
-            payload=json.dumps(record["parsed"]),
-        )
-        stats["sidecars_unmatched"] += 1
+    dest = None
+    if resolved.media_name:
+        dest = media_dest.get(f"{record['directory']}/{resolved.media_name}")
+
+    if dest:
+        outcome = _apply_sidecar_to_file(dest, record["parsed"],
+                                         record["entry_path"], db)
+        _tally(stats, outcome)
+        stats["sidecars_matched"] += 1
+        return
+
+    # Either no media name could be derived, or the media it names was
+    # never kept (already a duplicate elsewhere, or absent from the zip).
+    reason = resolved.reason or UnmatchedReason.NO_MEDIA_IN_DIR
+    parts = record["name_parts"]
+    db.record_unmatched_sidecar(
+        archive_id=archive_id,
+        sidecar_path=record["entry_path"],
+        archive_dir=record["directory"],
+        entry_name=record["entry_name"],
+        media_stem=parts.media_name,
+        counter=parts.counter,
+        reason=reason.value,
+        candidate_count=resolved.candidate_count,
+        payload=json.dumps(record["parsed"]),
+    )
+    stats["sidecars_unmatched"] += 1
+
+
+def _record_unreadable_sidecar(db: Database, archive_id: int, entry_path: str):
+    """Record a sidecar whose JSON could not be read at all.
+
+    Distinct from an unmatched one: there is no payload, so a rebind pass has
+    nothing to re-apply. The row exists so the sidecar is still countable and
+    inspectable instead of being indistinguishable from a successful skip.
+    """
+    path = Path(entry_path)
+    parts = split_sidecar_name(path.name)
+    db.record_unmatched_sidecar(
+        archive_id=archive_id,
+        sidecar_path=entry_path,
+        archive_dir=str(path.parent),
+        entry_name=path.name,
+        media_stem=parts.media_name,
+        counter=parts.counter,
+        reason=UnmatchedReason.UNPARSEABLE.value,
+        candidate_count=0,
+        payload=None,
+    )
 
 
 def _parse_sidecar_data(data: dict) -> dict:
@@ -606,7 +689,8 @@ def _process_media_entry_inner(entry: ArchiveEntry, dest_folder: Path, db: Datab
         # The surviving copy is where this entry's metadata now lives, so a
         # late-arriving sidecar must be routed there rather than dropped.
         return {"action": "skipped", "outcome": outcome,
-                "dest_path": surviving[0]["path"]}
+                "dest_path": surviving[0]["path"],
+                "sidecar_applied": sidecars.get(entry.path) is not None}
 
     # Matched the index but every copy is gone — treat as new and record why,
     # so the decision is queryable rather than silent.
@@ -640,7 +724,8 @@ def _process_media_entry_inner(entry: ArchiveEntry, dest_folder: Path, db: Datab
 
     db.log_archive_entry(archive_id, entry.path, "kept", kept_path=str(dest_path),
                          skip_reason=keep_reason)
-    return {"action": "kept", "outcome": outcome, "dest_path": str(dest_path)}
+    return {"action": "kept", "outcome": outcome, "dest_path": str(dest_path),
+            "sidecar_applied": sidecar is not None}
 
 
 def _index_saved_file(db: Database, path: Path, source_hash: str | None = None,
