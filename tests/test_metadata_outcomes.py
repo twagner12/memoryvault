@@ -96,7 +96,7 @@ class TestJpegNamedHeic:
 
     def test_gps_is_written_despite_the_extension(self, tmp_path, db,
                                                   jpeg_named_heic):
-        """The 12% case — extension trust was refusing a write that works."""
+        """The lying-extension case — trust it and this write is refused."""
         outcome = apply_sidecar(jpeg_named_heic, sidecar(**CHICAGO), db,
                                 "takeout:x.heic")
 

@@ -10,6 +10,8 @@ is what makes findings #7, #8, #9 and #10 verifiable rather than hopeful.
 import json
 import logging
 import os
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 
@@ -54,9 +56,66 @@ def is_metadata_json(path: str) -> bool:
     return Path(path).name.lower() == "metadata.json"
 
 
+def scratch_path(dest_folder: Path, tmpdir: Path | None = None) -> Path:
+    """Where this run spills entries too large to hold in memory.
+
+    Defaults to a sibling of the destination rather than the system temp
+    directory, for two reasons. `/tmp` is tmpfs on most modern Linux desktops —
+    7.7 GB of RAM here — and `archive.py` spills every entry over 50 MB to it,
+    so a large Takeout zip can exhaust memory. And a sibling is on the same
+    filesystem as the destination, which keeps `extract_entry_to_path`'s move a
+    rename instead of a cross-device copy of every kept file.
+
+    A sibling rather than a child of the vault on purpose: `scan_folder` walks
+    the vault with no ignore list, so scratch files left behind by a crashed
+    run would be indexed as media.
+    """
+    if tmpdir is not None:
+        return Path(tmpdir).resolve()
+    return dest_folder.with_name(dest_folder.name + ".mvtmp")
+
+
+@contextmanager
+def _scratch(path: Path):
+    """Point `tempfile` — and the 7z subprocess — at `path` for the duration.
+
+    One lever rather than a parameter threaded through five `tempfile` call
+    sites in `archive.py`. `TMPDIR` is set as well because `_stream_7z` shells
+    out and would otherwise write to the system default. Ambient `TMPDIR` is
+    deliberately *not* consulted as an input, so the scratch location has
+    exactly one source: this argument.
+
+    Not re-entrant, and not safe under concurrent ingests — `tempfile.tempdir`
+    is process-global. Ingest is single-threaded and `TaskManager` runs one
+    task at a time, which is what makes that acceptable.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    previous_tempdir = tempfile.tempdir
+    previous_env = os.environ.get("TMPDIR")
+
+    tempfile.tempdir = str(path)
+    os.environ["TMPDIR"] = str(path)
+    try:
+        yield path
+    finally:
+        tempfile.tempdir = previous_tempdir
+        if previous_env is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = previous_env
+        try:
+            path.rmdir()
+        except OSError as exc:
+            # Only removed when empty. Anything left is a spill from an entry
+            # that failed mid-write, and deleting it blindly would destroy the
+            # only evidence of what went wrong.
+            logger.info("leaving scratch dir %s in place: %s", path, exc)
+
+
 def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
                    progress_callback=None, title: str = None,
-                   allow_unreachable_volumes: bool = False) -> dict:
+                   allow_unreachable_volumes: bool = False,
+                   tmpdir: Path | None = None) -> dict:
     """Ingest a Takeout zip: stream files, dedup against DB, keep unique files.
 
     Single-pass streaming approach:
@@ -73,6 +132,9 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
         allow_unreachable_volumes: Proceed even when indexed files live on a
             volume that is not attached. Off by default because deduplicating
             against unreadable rows discards incoming originals.
+        tmpdir: Where to spill entries too large to hold in memory. Defaults
+            to a sibling of `dest_folder` — see `scratch_path` for why that,
+            rather than the system temp directory, is the safe default.
 
     Returns dict with stats: kept, skipped, errors, merged_metadata.
 
@@ -137,109 +199,112 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
     if progress_callback:
         progress_callback("start", processed=0, total=0)
 
-    for entry in iter_entries(archive_path, skip_entries=already_processed):
-        if entry.data is None and entry.temp_path is None:
-            db.log_archive_entry(archive_id, entry.path, "error", skip_reason="corrupt")
-            stats["errors"] += 1
-            processed_count += 1
-            continue
+    # Large entries spill to disk while streaming. Scoped to the run, so
+    # the setting cannot leak into anything else in the process.
+    with _scratch(scratch_path(dest_folder, tmpdir)):
+        for entry in iter_entries(archive_path, skip_entries=already_processed):
+            if entry.data is None and entry.temp_path is None:
+                db.log_archive_entry(archive_id, entry.path, "error", skip_reason="corrupt")
+                stats["errors"] += 1
+                processed_count += 1
+                continue
 
-        if is_metadata_json(entry.path):
-            db.log_archive_entry(archive_id, entry.path, "skipped", skip_reason="album_metadata")
-            stats["skipped"] += 1
-            processed_count += 1
-            continue
-
-        if is_sidecar_json(entry.path):
-            record = _read_sidecar_entry(entry)
-
-            if record is None:
-                # The JSON never parsed, so there is no payload to rebind
-                # from — but the sidecar existed, and saying so is the whole
-                # point of #6. Recorded with whatever the name yielded.
-                _record_unreadable_sidecar(db, archive_id, entry.path)
-                stats["sidecars_unmatched"] += 1
-                db.log_archive_entry(archive_id, entry.path, "skipped",
-                                     skip_reason="sidecar")
+            if is_metadata_json(entry.path):
+                db.log_archive_entry(archive_id, entry.path, "skipped", skip_reason="album_metadata")
                 stats["skipped"] += 1
                 processed_count += 1
                 continue
 
-            seen_sidecars.append(record)
-            # Register under every name shape this sidecar could belong to,
-            # so a media entry arriving later finds it by its own path.
-            for candidate in record["candidates"]:
-                if candidate not in sidecars:
-                    sidecars[candidate] = record["parsed"]
-                    records_by_candidate[candidate] = record
+            if is_sidecar_json(entry.path):
+                record = _read_sidecar_entry(entry)
 
-            # The media file may already have been processed.
-            failure = None
-            try:
+                if record is None:
+                    # The JSON never parsed, so there is no payload to rebind
+                    # from — but the sidecar existed, and saying so is the whole
+                    # point of #6. Recorded with whatever the name yielded.
+                    _record_unreadable_sidecar(db, archive_id, entry.path)
+                    stats["sidecars_unmatched"] += 1
+                    db.log_archive_entry(archive_id, entry.path, "skipped",
+                                         skip_reason="sidecar")
+                    stats["skipped"] += 1
+                    processed_count += 1
+                    continue
+
+                seen_sidecars.append(record)
+                # Register under every name shape this sidecar could belong to,
+                # so a media entry arriving later finds it by its own path.
                 for candidate in record["candidates"]:
-                    dest = media_dest.get(candidate)
-                    if dest:
-                        outcome = _apply_sidecar_to_file(
-                            dest, record["parsed"], entry.path, db)
-                        _tally(stats, outcome)
-                        record["bound"] = True
-                        break
-            except Exception as e:
-                # Same boundary the media path uses: one bad sidecar is an
-                # entry-level error, not the end of the run.
-                failure = str(e)[:200]
-                record["failed"] = True
+                    if candidate not in sidecars:
+                        sidecars[candidate] = record["parsed"]
+                        records_by_candidate[candidate] = record
 
-            if failure is not None:
-                db.log_archive_entry(archive_id, entry.path, "error",
-                                     skip_reason=failure)
-                stats["errors"] += 1
-            else:
-                db.log_archive_entry(archive_id, entry.path, "skipped",
-                                     skip_reason="sidecar")
+                # The media file may already have been processed.
+                failure = None
+                try:
+                    for candidate in record["candidates"]:
+                        dest = media_dest.get(candidate)
+                        if dest:
+                            outcome = _apply_sidecar_to_file(
+                                dest, record["parsed"], entry.path, db)
+                            _tally(stats, outcome)
+                            record["bound"] = True
+                            break
+                except Exception as e:
+                    # Same boundary the media path uses: one bad sidecar is an
+                    # entry-level error, not the end of the run.
+                    failure = str(e)[:200]
+                    record["failed"] = True
+
+                if failure is not None:
+                    db.log_archive_entry(archive_id, entry.path, "error",
+                                         skip_reason=failure)
+                    stats["errors"] += 1
+                else:
+                    db.log_archive_entry(archive_id, entry.path, "skipped",
+                                         skip_reason="sidecar")
+                    stats["skipped"] += 1
+                processed_count += 1
+                continue
+
+            if not is_media_file(entry.path):
+                db.log_archive_entry(archive_id, entry.path, "skipped", skip_reason="not_media")
                 stats["skipped"] += 1
+                processed_count += 1
+                continue
+
+            directory = str(Path(entry.path).parent)
+            dir_media.setdefault(directory, []).append(Path(entry.path).name)
+
+            # Process media file immediately — no buffering
+            try:
+                result = _process_media_entry(entry, dest_folder, db, sidecars, archive_id)
+            except Exception as e:
+                db.log_archive_entry(archive_id, entry.path, "error", skip_reason=str(e)[:200])
+                stats["errors"] += 1
+                processed_count += 1
+                continue
+            stats[result["action"]] += 1
+            if result.get("outcome"):
+                _tally(stats, result["outcome"])
+            if result.get("dest_path"):
+                media_dest[entry.path] = result["dest_path"]
+            if result.get("sidecar_applied"):
+                # This entry consumed a buffered sidecar, so the post-pass must
+                # not re-resolve and re-apply it. Harmless for a JPEG, whose date
+                # would then already be present, but a container that can only
+                # take the mtime has no such guard and would log a second
+                # merged_mtime_only row and a second deferred value.
+                consumed = records_by_candidate.get(entry.path)
+                if consumed is not None:
+                    consumed["bound"] = True
+
             processed_count += 1
-            continue
 
-        if not is_media_file(entry.path):
-            db.log_archive_entry(archive_id, entry.path, "skipped", skip_reason="not_media")
-            stats["skipped"] += 1
-            processed_count += 1
-            continue
-
-        directory = str(Path(entry.path).parent)
-        dir_media.setdefault(directory, []).append(Path(entry.path).name)
-
-        # Process media file immediately — no buffering
-        try:
-            result = _process_media_entry(entry, dest_folder, db, sidecars, archive_id)
-        except Exception as e:
-            db.log_archive_entry(archive_id, entry.path, "error", skip_reason=str(e)[:200])
-            stats["errors"] += 1
-            processed_count += 1
-            continue
-        stats[result["action"]] += 1
-        if result.get("outcome"):
-            _tally(stats, result["outcome"])
-        if result.get("dest_path"):
-            media_dest[entry.path] = result["dest_path"]
-        if result.get("sidecar_applied"):
-            # This entry consumed a buffered sidecar, so the post-pass must
-            # not re-resolve and re-apply it. Harmless for a JPEG, whose date
-            # would then already be present, but a container that can only
-            # take the mtime has no such guard and would log a second
-            # merged_mtime_only row and a second deferred value.
-            consumed = records_by_candidate.get(entry.path)
-            if consumed is not None:
-                consumed["bound"] = True
-
-        processed_count += 1
-
-        if progress_callback and processed_count % 10 == 0:
-            progress_callback("progress", processed=processed_count, total=processed_count,
-                              action=result["action"], path=entry.path,
-                              kept=stats["kept"], skipped=stats["skipped"],
-                              errors=stats["errors"], merged=stats["merged_metadata"])
+            if progress_callback and processed_count % 10 == 0:
+                progress_callback("progress", processed=processed_count, total=processed_count,
+                                  action=result["action"], path=entry.path,
+                                  kept=stats["kept"], skipped=stats["skipped"],
+                                  errors=stats["errors"], merged=stats["merged_metadata"])
 
     # Sidecars that never bound while streaming get one more attempt now that
     # every directory's media listing is complete; whatever is still unbound
@@ -484,8 +549,9 @@ def apply_sidecar(path: Path, sidecar: dict, db: Database, source_desc: str,
     """The one place metadata is applied. Every outcome is recorded.
 
     Routes on the file's *container*, sniffed from its bytes, never on its
-    extension — 12% of `.heic` files in the corpus are really JPEG, and
-    genuine HEIC cannot take an EXIF write at all.
+    extension — 4,771 of the 12,924 files in the shakedown vault (37%) are
+    not the format their name claims, most of them JPEGs wearing a `.png`
+    name — and genuine HEIC cannot take an EXIF write at all.
 
     - container supports EXIF → write; on refusal record `failed`
     - container cannot        → set the mtime from the date (all a video can

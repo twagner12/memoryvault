@@ -8,7 +8,9 @@ from memoryvault.database import Database, mark_auto_resolutions_stale
 from memoryvault.scanner import scan_folder
 from memoryvault.dedup import find_duplicates
 from memoryvault.metadata import get_exif_date, get_exif_gps, can_have_exif
-from memoryvault.ingest import ingest_archive, merge_metadata_between_files
+from memoryvault.ingest import (
+    ingest_archive, merge_metadata_between_files, scratch_path,
+)
 from memoryvault.rebind import rebind_sidecars
 from memoryvault.volumes import UnreachableVolumeError, find_unreachable_volumes
 
@@ -143,8 +145,15 @@ def merge(ctx, dry_run):
 @click.option("--allow-unreachable-volumes", is_flag=True,
               help="Ingest even though indexed files live on a detached volume. "
                    "Duplicates will be judged against rows that cannot be read.")
+@click.option("--tmpdir", type=click.Path(file_okay=False, resolve_path=True),
+              help="Where to spill entries larger than 50 MB. Defaults to "
+                   "<dest>.mvtmp, a sibling of the destination — same "
+                   "filesystem, and not inside the tree `scan` walks. The "
+                   "system temp dir is deliberately not used: it is tmpfs "
+                   "(RAM) on most Linux desktops, and a large Takeout zip "
+                   "will exhaust it. TMPDIR in the environment is ignored.")
 @click.pass_context
-def ingest(ctx, archive, dest, allow_unreachable_volumes):
+def ingest(ctx, archive, dest, allow_unreachable_volumes, tmpdir):
     """Ingest a Takeout zip: extract, dedup, and keep unique files."""
     db = Database(ctx.obj["db_path"])
 
@@ -166,12 +175,15 @@ def ingest(ctx, archive, dest, allow_unreachable_volumes):
                        f"Failed: {s['metadata_failed']}, "
                        f"Already present: {s['metadata_already_present']}")
 
+    scratch = scratch_path(Path(dest), Path(tmpdir) if tmpdir else None)
     try:
         click.echo(f"Ingesting {archive}")
         click.echo(f"Destination: {dest}")
+        click.echo(f"Scratch:     {scratch}")
         stats = ingest_archive(
             Path(archive), Path(dest), db, progress_callback=progress,
             allow_unreachable_volumes=allow_unreachable_volumes,
+            tmpdir=Path(tmpdir) if tmpdir else None,
         )
         click.echo(f"\nTotal files in database: {db.file_count():,}")
     except UnreachableVolumeError as e:
