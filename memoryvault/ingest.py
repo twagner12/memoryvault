@@ -518,12 +518,40 @@ def apply_sidecar(path: Path, sidecar: dict, db: Database, source_desc: str,
             _apply_date_as_mtime(path, sidecar["utc_epoch"], capture, db,
                                  source_desc, reason, outcome)
         if has_gps:
-            db.record_pending(str(path), "gps", _gps_payload(sidecar), reason,
-                              "deferred", source_desc=source_desc,
-                              file_blake3=hash_full(path))
+            # Guarded like every sibling branch. A genuine HEIC's GPS cannot be
+            # read back, so the outstanding row is the only thing that knows
+            # this location was already offered — the guard has to key on it.
+            _record_pending_once(db, path, "gps", _gps_payload(sidecar),
+                                 reason, "deferred", source_desc)
             outcome.deferred.append("gps")
 
     return outcome
+
+
+def _record_pending_once(db: Database, path: Path, field: str, value: str,
+                         reason: str, state: str, source_desc: str) -> bool:
+    """Record an outstanding value, unless that exact value is already recorded.
+
+    The single door onto `record_pending` for this module, so no branch can
+    acquire an unguarded one by accident. Two things depend on the check
+    happening *here* rather than inside the database call:
+
+    - The row is the drain pass's instruction. Two identical outstanding rows
+      mean the value gets applied twice.
+    - `hash_full` is a full re-read of the file, and it used to be evaluated as
+      a call argument — so a re-offer paid for the hash whether or not the row
+      was wanted. The duplicate-merge path re-offers the same sidecar every
+      time a byte-identical copy arrives, which this corpus does constantly.
+
+    Returns whether a row was written. Callers report the field as outstanding
+    either way: suppressing a duplicate row must not turn into a silent zero.
+    """
+    if db.has_outstanding_pending(str(path), field, value):
+        return False
+
+    db.record_pending(str(path), field, value, reason, state,
+                      source_desc=source_desc, file_blake3=hash_full(path))
+    return True
 
 
 def _date_payload(capture, utc_epoch: int) -> str:
@@ -563,16 +591,14 @@ def _apply_date_to_exif(path: Path, capture, utc_epoch: int, db: Database,
     try:
         write_exif_date(path, capture.local_dt, capture.offset)
     except UnparseableExifError:
-        db.record_pending(str(path), "date", payload, "failed_unparseable",
-                          "failed", source_desc=source_desc,
-                          file_blake3=hash_full(path))
+        _record_pending_once(db, path, "date", payload, "failed_unparseable",
+                             "failed", source_desc)
         outcome.failed.append("date")
         return
     except Exception as exc:
-        db.record_pending(str(path), "date", payload,
-                          f"failed_write_error:{type(exc).__name__}",
-                          "failed", source_desc=source_desc,
-                          file_blake3=hash_full(path))
+        _record_pending_once(db, path, "date", payload,
+                             f"failed_write_error:{type(exc).__name__}",
+                             "failed", source_desc)
         outcome.failed.append("date")
         return
 
@@ -582,9 +608,8 @@ def _apply_date_to_exif(path: Path, capture, utc_epoch: int, db: Database,
     if capture.is_assumed:
         # Written, but on a guessed offset. Recorded so a later pass can
         # revisit it once a better timezone source exists.
-        db.record_pending(str(path), "date", payload, "tz_unknown_assumed_utc",
-                          "deferred", source_desc=source_desc,
-                          file_blake3=hash_full(path))
+        _record_pending_once(db, path, "date", payload,
+                             "tz_unknown_assumed_utc", "deferred", source_desc)
         outcome.deferred.append("date")
 
 
@@ -598,16 +623,14 @@ def _apply_gps_to_exif(path: Path, sidecar: dict, db: Database,
     try:
         write_exif_gps(path, sidecar["lat"], sidecar["lon"])
     except UnparseableExifError:
-        db.record_pending(str(path), "gps", payload, "failed_unparseable",
-                          "failed", source_desc=source_desc,
-                          file_blake3=hash_full(path))
+        _record_pending_once(db, path, "gps", payload, "failed_unparseable",
+                             "failed", source_desc)
         outcome.failed.append("gps")
         return
     except Exception as exc:
-        db.record_pending(str(path), "gps", payload,
-                          f"failed_write_error:{type(exc).__name__}",
-                          "failed", source_desc=source_desc,
-                          file_blake3=hash_full(path))
+        _record_pending_once(db, path, "gps", payload,
+                             f"failed_write_error:{type(exc).__name__}",
+                             "failed", source_desc)
         outcome.failed.append("gps")
         return
 
@@ -643,8 +666,8 @@ def _apply_date_as_mtime(path: Path, utc_epoch: int, capture, db: Database,
     db.log_metadata_merge(str(path), source_desc, "merged_mtime_only", payload)
     outcome.merged_mtime_only.append("date")
 
-    db.record_pending(str(path), "date", payload, reason, "deferred",
-                      source_desc=source_desc, file_blake3=hash_full(path))
+    _record_pending_once(db, path, "date", payload, reason, "deferred",
+                         source_desc)
     outcome.deferred.append("date")
 
 
@@ -896,16 +919,14 @@ def _copy_exif_date(target: Path, local_dt, source: Path, db: Database,
     try:
         write_exif_date(target, local_dt, offset)
     except UnparseableExifError:
-        db.record_pending(str(target), "date", payload, "failed_unparseable",
-                          "failed", source_desc=f"file:{source}",
-                          file_blake3=hash_full(target))
+        _record_pending_once(db, target, "date", payload, "failed_unparseable",
+                             "failed", f"file:{source}")
         outcome.failed.append("date")
         return
     except Exception as exc:
-        db.record_pending(str(target), "date", payload,
-                          f"failed_write_error:{type(exc).__name__}",
-                          "failed", source_desc=f"file:{source}",
-                          file_blake3=hash_full(target))
+        _record_pending_once(db, target, "date", payload,
+                             f"failed_write_error:{type(exc).__name__}",
+                             "failed", f"file:{source}")
         outcome.failed.append("date")
         return
 

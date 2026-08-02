@@ -378,6 +378,24 @@ class Database:
         self.conn.commit()
         return row["id"]
 
+    def has_outstanding_pending(self, file_path: str, field: str,
+                                value: str) -> bool:
+        """True when this exact value is already recorded and still outstanding.
+
+        The idempotency key for a deferral. Callers use it to skip both the
+        insert *and* the work of building the row — the file hash in
+        particular, which is a full re-read. Applied rows deliberately do not
+        match: once a drain pass has stamped `applied_at`, the value is no
+        longer outstanding and a fresh offer is new information.
+        """
+        row = self.conn.execute(
+            "SELECT 1 FROM metadata_pending "
+            "WHERE file_path = ? AND field = ? AND value = ? "
+            "AND applied_at IS NULL LIMIT 1",
+            (file_path, field, value),
+        ).fetchone()
+        return row is not None
+
     def get_pending(self, file_path: str = None, outstanding_only: bool = True
                     ) -> list[dict]:
         sql = "SELECT * FROM metadata_pending WHERE 1=1"
