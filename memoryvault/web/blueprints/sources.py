@@ -152,6 +152,10 @@ def archive_detail(archive_id):
     merge_count = db.conn.execute("""
         SELECT COUNT(*) as cnt FROM metadata_log
         WHERE source_desc LIKE 'takeout:%'
+        -- 'already_present' rows live in this table too, but they record a
+        -- value that was declined because the file already had one. Counting
+        -- them as merges would inflate the figure with non-merges.
+        AND field != 'already_present'
         AND target_path IN (SELECT kept_path FROM archive_entries WHERE archive_id = ?)
     """, (archive_id,)).fetchone()["cnt"]
 

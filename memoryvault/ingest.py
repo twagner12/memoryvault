@@ -110,7 +110,8 @@ def ingest_archive(archive_path: Path, dest_folder: Path, db: Database,
 
     stats = {"kept": 0, "skipped": 0, "errors": 0, "merged_metadata": 0,
              "sidecars_matched": 0, "sidecars_unmatched": 0,
-             "metadata_deferred": 0, "metadata_failed": 0}
+             "metadata_deferred": 0, "metadata_failed": 0,
+             "metadata_already_present": 0}
 
     # Sidecars are small (just JSON text) — safe to buffer.
     # Keyed by the *resolved* media entry path, so a lookup by a media file's
@@ -317,6 +318,7 @@ def _tally(stats: dict, outcome: "Outcome"):
     stats["merged_metadata"] += outcome.log_count
     stats["metadata_deferred"] += len(outcome.deferred)
     stats["metadata_failed"] += len(outcome.failed)
+    stats["metadata_already_present"] += len(outcome.already_present)
 
 
 def _resolve_leftover_sidecars(db: Database, archive_id: int,
@@ -468,7 +470,12 @@ class Outcome:
 
     @property
     def log_count(self) -> int:
-        """Fields that produced a metadata_log row — what `stats` counts."""
+        """Fields whose value actually reached the file — what `merged` counts.
+
+        Not every `metadata_log` row: `already_present` also lands there, but
+        it records a value that was *declined*, and folding it in here would
+        inflate the run's "metadata merged" figure with non-merges.
+        """
         return len(self.merged) + len(self.merged_mtime_only)
 
 
@@ -528,6 +535,34 @@ def apply_sidecar(path: Path, sidecar: dict, db: Database, source_desc: str,
     return outcome
 
 
+def _record_already_present(db: Database, path: Path, field: str,
+                            offered: dict, satisfied_by: str, db_source: str,
+                            outcome: Outcome):
+    """Record that the file already carried what the sidecar offered.
+
+    The fourth outcome, and the one that was missing: 648 bound sidecars in the
+    shakedown produced no row in either table because "the file already has
+    this" was decided and then forgotten. Silence there is indistinguishable
+    from a sidecar that never bound at all, which is the exact confusion #6 was
+    about.
+
+    `offered` carries the sidecar's raw values, never the resolved date
+    rendering, so the JSON is a pure function of the offer: it cannot drift
+    with a timezone lookup, which makes it a stable idempotency key. Keys are
+    sorted for the same reason.
+    """
+    value = json.dumps({"field": field, "offered": offered,
+                        "satisfied_by": satisfied_by}, sort_keys=True)
+
+    # An outcome is still an outcome on a re-offer — the caller must hear it —
+    # but the row is written once.
+    outcome.already_present.append(field)
+    if db.has_already_present(str(path), value):
+        return
+
+    db.log_metadata_merge(str(path), db_source, "already_present", value)
+
+
 def _record_pending_once(db: Database, path: Path, field: str, value: str,
                          reason: str, state: str, source_desc: str) -> bool:
     """Record an outstanding value, unless that exact value is already recorded.
@@ -584,7 +619,8 @@ def _gps_payload(sidecar: dict) -> str:
 def _apply_date_to_exif(path: Path, capture, utc_epoch: int, db: Database,
                         source_desc: str, outcome: Outcome):
     if get_exif_date(path):
-        outcome.already_present.append("date")
+        _record_already_present(db, path, "date", {"utc_epoch": utc_epoch},
+                                "exif_date", source_desc, outcome)
         return
 
     payload = _date_payload(capture, utc_epoch)
@@ -616,7 +652,9 @@ def _apply_date_to_exif(path: Path, capture, utc_epoch: int, db: Database,
 def _apply_gps_to_exif(path: Path, sidecar: dict, db: Database,
                        source_desc: str, outcome: Outcome):
     if get_exif_gps(path):
-        outcome.already_present.append("gps")
+        _record_already_present(db, path, "gps",
+                                {"lat": sidecar["lat"], "lon": sidecar["lon"]},
+                                "exif_gps", source_desc, outcome)
         return
 
     payload = _gps_payload(sidecar)
@@ -656,7 +694,8 @@ def _apply_date_as_mtime(path: Path, utc_epoch: int, capture, db: Database,
     # arrives with its own sidecar, which the corpus does constantly: 51,863
     # entries are already skipped as duplicates.
     if int(path.stat().st_mtime) == int(utc_epoch):
-        outcome.already_present.append("date")
+        _record_already_present(db, path, "date", {"utc_epoch": utc_epoch},
+                                "mtime", source_desc, outcome)
         return
 
     payload = _date_payload(capture, utc_epoch)
@@ -905,7 +944,9 @@ def _copy_exif_date(target: Path, local_dt, source: Path, db: Database,
     from memoryvault.metadata import get_exif_offset
 
     if get_exif_date(target):
-        outcome.already_present.append("date")
+        _record_already_present(db, target, "date",
+                                {"datetime_local": local_dt.isoformat()},
+                                "exif_date", f"file:{source}", outcome)
         return
 
     offset = get_exif_offset(source)

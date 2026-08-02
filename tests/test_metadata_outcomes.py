@@ -12,7 +12,8 @@ independent outcomes, and a video's date legitimately produces both a
 
 Legal states for one (file, field):
 
-  already_present  the file already had it; nothing to merge
+  already_present  metadata_log(field='already_present') only — the file
+                   already carried the offered value
   merged           metadata_log only
   failed           metadata_pending(state='failed') only
   deferred         metadata_pending(state='deferred') only
@@ -20,6 +21,12 @@ Legal states for one (file, field):
   merged + tz_unknown_assumed_utc date written under an assumed UTC offset
 
 Anything else — above all a silent zero, present in neither table — is a bug.
+
+`already_present` is the one state whose cardinality may legitimately exceed
+one: two different sidecars can offer two different dates to the same
+already-dated file, and each refusal is a separate fact worth recording. What
+is forbidden is the *identical* offer recorded twice, which is what a re-ingest
+would produce, so repeats are counted separately and rejected on their own.
 """
 
 import json
@@ -208,28 +215,111 @@ class TestFailedWrites:
 
 
 class TestAlreadyPresent:
-    def test_existing_date_is_not_overwritten(self, tmp_path, db):
+    """The 648 cases that left no row anywhere.
+
+    A bound sidecar whose target already carries the offered value was, until
+    now, indistinguishable from a sidecar that was never bound at all. Both
+    produced silence.
+    """
+
+    @pytest.fixture
+    def dated_jpeg(self, tmp_path) -> Path:
         path = tmp_path / "p.jpg"
         path.write_bytes(make_jpeg_bytes(exif={
             "0th": {}, "Exif": {
                 piexif.ExifIFD.DateTimeOriginal: b"1999:12:31 23:59:59"},
             "GPS": {}, "1st": {}}))
+        return path
 
-        outcome = apply_sidecar(path, sidecar(**CHICAGO), db, "takeout:p.jpg")
+    def test_existing_date_is_not_overwritten(self, db, dated_jpeg):
+        outcome = apply_sidecar(dated_jpeg, sidecar(**CHICAGO), db,
+                                "takeout:p.jpg")
 
         assert "date" in outcome.already_present
-        assert get_exif_date(path).startswith("1999-12-31")
+        assert get_exif_date(dated_jpeg).startswith("1999-12-31")
 
-    def test_already_present_writes_no_rows(self, tmp_path, db):
-        path = tmp_path / "p.jpg"
-        path.write_bytes(make_jpeg_bytes(exif={
-            "0th": {}, "Exif": {
-                piexif.ExifIFD.DateTimeOriginal: b"1999:12:31 23:59:59"},
-            "GPS": {}, "1st": {}}))
+    def test_already_present_writes_no_pending_row(self, db, dated_jpeg):
+        """Nothing is outstanding: the file has the data, just not ours."""
+        apply_sidecar(dated_jpeg, sidecar(), db, "takeout:p.jpg")
 
-        apply_sidecar(path, sidecar(), db, "takeout:p.jpg")
+        assert db.get_pending(str(dated_jpeg)) == []
 
-        assert db.get_pending(str(path)) == []
+    def test_the_refusal_is_recorded(self, db, dated_jpeg):
+        apply_sidecar(dated_jpeg, sidecar(), db, "takeout:p.jpg")
+
+        rows = db.conn.execute(
+            "SELECT field, value, source_desc FROM metadata_log "
+            "WHERE target_path = ?", (str(dated_jpeg),)).fetchall()
+        assert [r["field"] for r in rows] == ["already_present"]
+        assert rows[0]["source_desc"] == "takeout:p.jpg"
+
+    def test_the_row_says_what_was_offered_and_what_won(self, db, dated_jpeg):
+        """Enough to audit the decision without the sidecar or the file."""
+        apply_sidecar(dated_jpeg, sidecar(), db, "takeout:p.jpg")
+
+        value = json.loads(db.conn.execute(
+            "SELECT value FROM metadata_log WHERE target_path = ?",
+            (str(dated_jpeg),)).fetchone()["value"])
+        assert value["field"] == "date"
+        assert value["offered"] == {"utc_epoch": CHICAGO_UTC}
+        assert value["satisfied_by"] == "exif_date"
+
+    def test_gps_already_present_names_exif_gps(self, db, jpeg_with_full_gps):
+        apply_sidecar(jpeg_with_full_gps, sidecar(utc_epoch=None, **CHICAGO),
+                      db, "takeout:p.jpg")
+
+        value = json.loads(db.conn.execute(
+            "SELECT value FROM metadata_log WHERE target_path = ?",
+            (str(jpeg_with_full_gps),)).fetchone()["value"])
+        assert value["field"] == "gps"
+        assert value["satisfied_by"] == "exif_gps"
+        assert value["offered"]["lat"] == pytest.approx(CHICAGO["lat"])
+
+    def test_mtime_satisfaction_is_named_as_such(self, db, small_mp4):
+        """A video's date lives in its mtime, so that is what satisfied it."""
+        apply_sidecar(small_mp4, sidecar(), db, "takeout:v.mp4")
+        apply_sidecar(small_mp4, sidecar(), db, "takeout:v.mp4")
+
+        rows = db.conn.execute(
+            "SELECT value FROM metadata_log WHERE target_path = ? "
+            "AND field = 'already_present'", (str(small_mp4),)).fetchall()
+        assert len(rows) == 1
+        assert json.loads(rows[0]["value"])["satisfied_by"] == "mtime"
+
+    def test_re_offering_records_nothing_further(self, db, dated_jpeg):
+        """The re-ingest guard: identical offer, one row."""
+        for _ in range(5):
+            apply_sidecar(dated_jpeg, sidecar(), db, "takeout:p.jpg")
+
+        counts = _outcome_states(db, str(dated_jpeg), "date")
+
+        assert counts == Counter({("log", "already_present"): 1})
+        assert_legal(counts, str(dated_jpeg), "date", already_present=True)
+
+    def test_a_different_offer_is_recorded_separately(self, db, dated_jpeg):
+        """Two sidecars, two different dates, two distinct refusals."""
+        apply_sidecar(dated_jpeg, sidecar(), db, "takeout:a.jpg")
+        apply_sidecar(dated_jpeg, sidecar(utc_epoch=CHICAGO_UTC + 86_400), db,
+                      "takeout:b.jpg")
+
+        counts = _outcome_states(db, str(dated_jpeg), "date")
+
+        assert counts == Counter({("log", "already_present"): 2})
+        assert_legal(counts, str(dated_jpeg), "date", already_present=True)
+
+    def test_the_invariant_rejects_an_identical_repeat(self, db, dated_jpeg):
+        """Guard the guard: plant the row the suppressed write would have made."""
+        apply_sidecar(dated_jpeg, sidecar(), db, "takeout:p.jpg")
+        planted = db.conn.execute(
+            "SELECT value FROM metadata_log WHERE target_path = ?",
+            (str(dated_jpeg),)).fetchone()["value"]
+        db.log_metadata_merge(str(dated_jpeg), "takeout:p.jpg",
+                              "already_present", planted)
+
+        counts = _outcome_states(db, str(dated_jpeg), "date")
+
+        with pytest.raises(AssertionError, match="already_present"):
+            assert_legal(counts, str(dated_jpeg), "date", already_present=True)
 
 
 class TestGpsMerge:
@@ -262,16 +352,33 @@ def _outcome_states(db, file_path: str, field: str) -> Counter:
     `merged_mtime_only` rows and two identical `deferred` rows, which
     collapsed to exactly the same one-of-each shape a correct single apply
     produces. Presence was never the whole invariant — cardinality is.
+
+    `already_present` rows carry which field they refer to inside their value,
+    because `metadata_log.field` is spent naming the outcome. Distinct offers
+    are counted under `already_present`; byte-identical repeats — the
+    re-ingest failure — are counted under `already_present_repeat`, so the two
+    can be judged separately.
     """
     counts: Counter = Counter()
+    already_present: Counter = Counter()
 
     for row in db.conn.execute(
-        "SELECT field FROM metadata_log WHERE target_path = ?", (file_path,)
+        "SELECT field, value FROM metadata_log WHERE target_path = ?",
+        (file_path,)
     ).fetchall():
-        if row["field"] == field:
+        if row["field"] == "already_present":
+            if json.loads(row["value"])["field"] == field:
+                already_present[row["value"]] += 1
+        elif row["field"] == field:
             counts[("log", "merged")] += 1
         elif row["field"] == "merged_mtime_only" and field == "date":
             counts[("log", "merged_mtime_only")] += 1
+
+    if already_present:
+        counts[("log", "already_present")] = len(already_present)
+        repeats = sum(n - 1 for n in already_present.values())
+        if repeats:
+            counts[("log", "already_present_repeat")] = repeats
 
     for row in db.conn.execute(
         "SELECT field, state, reason FROM metadata_pending WHERE file_path = ?",
@@ -291,24 +398,34 @@ def assert_legal(counts: Counter, file_path: str, field: str,
                  already_present: bool):
     """The whole invariant, in one place.
 
-    Three separate claims, each with its own failure message:
-      - already-present fields record nothing
+    Four separate claims, each with its own failure message:
+      - an already-present field records exactly that, and nothing else
+      - no offer is recorded twice byte-for-byte
       - a field the sidecar carried records *something* (no silent zero)
       - each state is recorded exactly once, and the combination is legal
     """
     name = Path(file_path).name
 
+    assert ("log", "already_present_repeat") not in counts, (
+        f"{name}/{field}: the identical offer was recorded as already_present "
+        f"{counts[('log', 'already_present_repeat')] + 1}×. Re-offering a "
+        f"sidecar must be a no-op, not another row.")
+
     if already_present:
-        assert not counts, (
-            f"{name}/{field}: already had this field, so nothing should have "
-            f"been recorded, got {dict(counts)}")
+        assert set(counts) == {("log", "already_present")}, (
+            f"{name}/{field}: the file already carried this field, so the only "
+            f"legal record is an already_present log row, got {dict(counts)}")
         return
 
     assert counts, (
         f"{name}/{field}: SILENT ZERO — the sidecar carried this field and no "
         f"row records what happened to it")
 
-    repeated = {state: n for state, n in counts.items() if n > 1}
+    # already_present is exempt: two sidecars may offer two different values to
+    # the same already-populated file, and both refusals deserve a row. An
+    # identical repeat is caught above, which is the failure that matters.
+    repeated = {state: n for state, n in counts.items()
+                if n > 1 and state != ("log", "already_present")}
     assert not repeated, (
         f"{name}/{field}: DUPLICATE OUTCOME — "
         + ", ".join(f"{state} recorded {n}×" for state, n in repeated.items())
@@ -473,6 +590,15 @@ class TestInvariantAcrossAMixedArchive:
             "Takeout/Photos/DSC_0109(9).JPG": make_jpeg_bytes(color="yellow"),
             "Takeout/Photos/DSC_0109.JPG.supplemental-meta(9).json":
                 make_sidecar_bytes(CHICAGO_UTC, lat=41.8781, lon=-87.6298),
+
+            # already carries its own date → the sidecar's is refused, and
+            # that refusal is the outcome 648 sidecars used to leave unrecorded
+            "Takeout/Photos/dated.jpg": make_jpeg_bytes(color="purple", exif={
+                "0th": {}, "Exif": {
+                    piexif.ExifIFD.DateTimeOriginal: b"1999:12:31 23:59:59"},
+                "GPS": {}, "1st": {}}),
+            "Takeout/Photos/dated.jpg.supplemental-metadata.json":
+                make_sidecar_bytes(CHICAGO_UTC),
         }
         zip_path = make_zip(entries)
         dest = tmp_path / "vault"
@@ -483,28 +609,30 @@ class TestInvariantAcrossAMixedArchive:
         stats, dest = ingested
 
         # Rebuild what each kept file was offered, from the archive entries.
+        # The bool is whether the file already carried that field.
         offered = {
-            "plain.jpg": {"date", "gps"},
-            "noloc.jpg": {"date"},
-            "real.heic": {"date", "gps"},
-            "fake.heic": {"date", "gps"},
-            "clip.mp4": {"date"},
-            "early.mp4": {"date"},
-            "DSC_0109(9).JPG": {"date", "gps"},
+            "plain.jpg": {"date": False, "gps": False},
+            "noloc.jpg": {"date": False},
+            "real.heic": {"date": False, "gps": False},
+            "fake.heic": {"date": False, "gps": False},
+            "clip.mp4": {"date": False},
+            "early.mp4": {"date": False},
+            "DSC_0109(9).JPG": {"date": False, "gps": False},
+            "dated.jpg": {"date": True},
         }
 
         checked = 0
         for name, fields in offered.items():
             path = dest / name
             assert path.exists(), f"{name} was not kept by ingest"
-            for field in fields:
+            for field, present in fields.items():
                 states = _outcome_states(db, str(path), field)
-                assert_legal(states, str(path), field, already_present=False)
+                assert_legal(states, str(path), field, already_present=present)
                 checked += 1
 
-        # 2 + 1 + 2 + 2 + 1 + 1 + 2 — pinned so a fixture that silently stops
-        # being ingested cannot quietly shrink the invariant's coverage.
-        assert checked == 11
+        # 2 + 1 + 2 + 2 + 1 + 1 + 2 + 1 — pinned so a fixture that silently
+        # stops being ingested cannot quietly shrink the invariant's coverage.
+        assert checked == 12
 
     def test_no_sidecar_went_unmatched(self, ingested, db):
         """Every sidecar in this archive is nameable by the new matcher."""

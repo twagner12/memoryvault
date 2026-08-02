@@ -342,6 +342,21 @@ class Database:
 
     # --- Metadata log ---
 
+    def has_already_present(self, target_path: str, value: str) -> bool:
+        """True when this exact refusal is already on record.
+
+        The idempotency key for `already_present`, keyed on the value rather
+        than the field: two sidecars may offer two *different* dates to the
+        same already-dated file, and each refusal is its own fact. Only the
+        byte-identical repeat — what a re-ingest produces — is suppressed.
+        """
+        row = self.conn.execute(
+            "SELECT 1 FROM metadata_log WHERE target_path = ? "
+            "AND field = 'already_present' AND value = ? LIMIT 1",
+            (target_path, value),
+        ).fetchone()
+        return row is not None
+
     def log_metadata_merge(self, target_path: str, source_desc: str, field: str, value: str):
         self.conn.execute(
             "INSERT INTO metadata_log (target_path, source_desc, field, value, merge_time) "

@@ -161,6 +161,9 @@ def ingest(ctx, archive, dest, allow_unreachable_volumes):
             s = kwargs["stats"]
             click.echo(f"\nDone. Kept: {s['kept']}, Skipped: {s['skipped']}, "
                         f"Errors: {s['errors']}, Metadata merged: {s['merged_metadata']}")
+            click.echo(f"      Deferred: {s['metadata_deferred']}, "
+                       f"Failed: {s['metadata_failed']}, "
+                       f"Already present: {s['metadata_already_present']}")
 
     try:
         click.echo(f"Ingesting {archive}")

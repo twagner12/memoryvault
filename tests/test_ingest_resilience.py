@@ -260,6 +260,10 @@ class TestSidecarAppliedExactlyOnce:
 
         Live-DB relevance: 51,863 entries are already skipped as duplicates,
         and archives 2 and 3 are literally the same zip.
+
+        The declined second offer is not silent: it leaves one
+        `already_present` row, which is the difference between "we considered
+        it and the file already had it" and "nothing happened".
         """
         ingest_archive(make_zip({
             "T/P/clip.mp4": small_mp4.read_bytes(),
@@ -273,7 +277,8 @@ class TestSidecarAppliedExactlyOnce:
             "SELECT field FROM metadata_log WHERE target_path = ?",
             (survivor,)).fetchall()]
 
-        assert logs == ["merged_mtime_only"]
+        assert logs.count("merged_mtime_only") == 1
+        assert logs.count("already_present") == 1
         assert len(db.get_pending(survivor)) == 1
 
     def test_duplicate_entry_with_a_jpeg_survivor(self, tmp_path, db, make_zip):
@@ -291,6 +296,7 @@ class TestSidecarAppliedExactlyOnce:
             (survivor,)).fetchall()]
 
         assert logs.count("date") == 1
+        assert logs.count("already_present") == 1
 
     def test_sidecar_counted_once_in_stats(self, tmp_path, db, make_zip,
                                            small_mp4):
