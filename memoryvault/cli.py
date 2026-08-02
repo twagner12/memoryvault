@@ -9,6 +9,7 @@ from memoryvault.scanner import scan_folder
 from memoryvault.dedup import find_duplicates
 from memoryvault.metadata import get_exif_date, get_exif_gps, can_have_exif
 from memoryvault.ingest import ingest_archive, merge_metadata_between_files
+from memoryvault.rebind import rebind_sidecars
 from memoryvault.volumes import UnreachableVolumeError, find_unreachable_volumes
 
 
@@ -203,7 +204,8 @@ def stats(ctx):
         click.echo(f"Metadata pending:  {outstanding:,}"
                    + ("   (memoryvault pending)" if outstanding else ""))
         click.echo(f"Sidecars unmatched:{unbound:,}"
-                   + ("   (memoryvault unmatched)" if unbound else ""))
+                   + ("   (memoryvault unmatched | rebind --dry-run)"
+                      if unbound else ""))
     finally:
         db.close()
 
@@ -274,6 +276,58 @@ def unmatched(ctx, limit):
                 click.echo(f"      sought: {row['media_stem']}"
                            + (f"  counter={row['counter']}" if row["counter"] else "")
                            + f"  in {row['archive_dir']}")
+    finally:
+        db.close()
+
+
+@cli.command()
+@click.option("--dry-run", is_flag=True,
+              help="Report what would bind without applying or recording anything.")
+@click.pass_context
+def rebind(ctx, dry_run):
+    """Re-offer unmatched sidecars to the files now in the vault.
+
+    Google splits an album directory across zip parts, so a sidecar in part 9
+    often describes a photo kept from part 8. Ingest sees one part at a time
+    and cannot bind across that boundary; this pass runs once every part is in.
+
+    Binding obeys every rule the ingest matcher does — same directory only,
+    counter arithmetic, and a refusal whenever more than one file could match.
+    """
+    # A dry run opens read-only, so it cannot write even by accident — not
+    # even the schema migration that opening normally applies.
+    db = Database(ctx.obj["db_path"], read_only=dry_run)
+    try:
+        stats = rebind_sidecars(db, dry_run=dry_run)
+
+        verb = "Would bind" if dry_run else "Bound"
+        click.echo(f"{verb} {stats['bound']:,} sidecar(s).")
+
+        if stats["by_archive"]:
+            click.echo("\nBy the archive the sidecar came from:")
+            for archive_id, count in sorted(stats["by_archive"].items()):
+                archive = db.conn.execute(
+                    "SELECT path FROM archives WHERE id = ?",
+                    (archive_id,)).fetchone()
+                name = Path(archive["path"]).name if archive else f"id={archive_id}"
+                click.echo(f"  {count:>7,}  {name}")
+
+        if stats["duplicate_rows"]:
+            tail = ("would be marked without re-applying" if dry_run
+                    else "were marked without re-applying")
+            click.echo(f"\n{stats['duplicate_rows']:,} further row(s) carried "
+                       f"an identical offer and {tail}.")
+
+        if stats["refused"]:
+            total = sum(stats["refused"].values())
+            click.echo(f"\n{total:,} sidecar(s) still unbound:")
+            for reason, count in sorted(stats["refused"].items(),
+                                        key=lambda kv: -kv[1]):
+                click.echo(f"  {count:>7,}  {reason}")
+            click.echo("These rows are left in place for a later run.")
+
+        if dry_run:
+            click.echo("\nDry run — nothing was written.")
     finally:
         db.close()
 

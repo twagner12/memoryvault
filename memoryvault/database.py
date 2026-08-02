@@ -107,7 +107,9 @@ CREATE TABLE IF NOT EXISTS sidecars_unmatched (
     candidate_count INTEGER DEFAULT 0,
     payload         TEXT,            -- parsed sidecar JSON (date/geo)
     recorded_at     TEXT NOT NULL,
-    rebound_at      TEXT             -- NULL = still unmatched
+    rebound_at      TEXT,            -- NULL = still unmatched
+    rebound_path    TEXT,            -- vault file it finally bound to
+    rebound_outcome TEXT             -- JSON: what applying it actually did
 );
 """
 
@@ -150,12 +152,31 @@ MIGRATIONS: dict[str, dict[str, str]] = {
         "confidence": "INTEGER DEFAULT 100",
         "stale": "INTEGER DEFAULT 0",
     },
+    "sidecars_unmatched": {
+        "rebound_path": "TEXT",
+        "rebound_outcome": "TEXT",
+    },
 }
 
 
 class Database:
-    def __init__(self, db_path: Path = DEFAULT_DB_PATH):
+    def __init__(self, db_path: Path = DEFAULT_DB_PATH, read_only: bool = False):
+        """Open the database, applying any missing schema.
+
+        `read_only` opens through SQLite's `mode=ro` URI and skips schema
+        initialisation, which is itself a write. It exists so an inspection —
+        a `--dry-run`, a report — is *structurally* incapable of modifying the
+        database rather than merely promising not to. Any write attempted on
+        such a connection raises instead of succeeding quietly.
+        """
         self.db_path = db_path
+        self.read_only = read_only
+
+        if read_only:
+            self.conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            self.conn.row_factory = sqlite3.Row
+            return
+
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -330,6 +351,46 @@ class Database:
             "ON CONFLICT(archive_id, entry_path) DO UPDATE SET "
             "status=excluded.status, kept_path=excluded.kept_path, skip_reason=excluded.skip_reason",
             (archive_id, entry_path, status, kept_path, skip_reason),
+        )
+        self.conn.commit()
+
+    # Entries that are neither media nor a candidate for one. Excluded when the
+    # rebind pass builds its per-directory listings, so a sidecar can never be
+    # mistaken for the media file it describes.
+    NON_MEDIA_SKIP_REASONS = ("sidecar", "album_metadata", "not_media")
+
+    def get_media_entries(self) -> list[dict]:
+        """Every media entry from every archive, with where it was kept.
+
+        Deliberately not scoped to one archive. Google splits an album
+        directory across zip parts, so the sidecar and the photo it describes
+        routinely arrive in different archives — and the entry path is the path
+        *inside* the zip, so the directory string is identical in both.
+        Restricting this to a single archive is precisely what stops those
+        sidecars binding at ingest time.
+        """
+        placeholders = ", ".join("?" * len(self.NON_MEDIA_SKIP_REASONS))
+        rows = self.conn.execute(
+            f"SELECT entry_path, status, kept_path FROM archive_entries "
+            f"WHERE skip_reason IS NULL OR skip_reason NOT IN ({placeholders})",
+            self.NON_MEDIA_SKIP_REASONS,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_sidecar_rebound(self, sidecar_id: int, target_path: str,
+                             outcome: str):
+        """Record that a sidecar finally found its media file, and what happened.
+
+        Written after the metadata has been applied. A crash in between leaves
+        `rebound_at` NULL and the next run re-offers the sidecar — which is a
+        no-op, because `apply_sidecar` refuses to record or write a value the
+        target already carries.
+        """
+        self.conn.execute(
+            "UPDATE sidecars_unmatched SET rebound_at = ?, rebound_path = ?, "
+            "rebound_outcome = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), target_path, outcome,
+             sidecar_id),
         )
         self.conn.commit()
 
