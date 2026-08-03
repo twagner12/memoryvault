@@ -55,7 +55,7 @@ def scan(ctx, folder, source):
 @click.pass_context
 def dupes(ctx, limit):
     """Find and display duplicate file groups."""
-    db = Database(ctx.obj["db_path"])
+    db = Database(ctx.obj["db_path"], read_only=True)
     try:
         results = find_duplicates(db)
         if not results:
@@ -196,7 +196,7 @@ def ingest(ctx, archive, dest, allow_unreachable_volumes, tmpdir):
 @click.pass_context
 def stats(ctx):
     """Show database statistics."""
-    db = Database(ctx.obj["db_path"])
+    db = Database(ctx.obj["db_path"], read_only=True)
     try:
         total = db.file_count()
         dupes = db.find_duplicate_groups()
@@ -232,7 +232,7 @@ def pending(ctx, limit):
     or a video, or a write that failed. Each row carries enough to be applied
     later without the original sidecar.
     """
-    db = Database(ctx.obj["db_path"])
+    db = Database(ctx.obj["db_path"], read_only=True)
     try:
         summary = db.get_pending_summary()
         if not summary:
@@ -268,7 +268,7 @@ def unmatched(ctx, limit):
     rows keep the parsed payload, so a rebind pass needs neither the zip nor
     the JSON file — both of which are gone after ingest.
     """
-    db = Database(ctx.obj["db_path"])
+    db = Database(ctx.obj["db_path"], read_only=True)
     try:
         summary = db.get_unmatched_summary()
         if not summary:
@@ -381,7 +381,7 @@ def migrate(ctx, yes):
 @click.pass_context
 def volumes(ctx):
     """Report indexed volumes that are not currently attached."""
-    db = Database(ctx.obj["db_path"])
+    db = Database(ctx.obj["db_path"], read_only=True)
     try:
         unreachable = find_unreachable_volumes(db)
         if not unreachable:
