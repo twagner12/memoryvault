@@ -10,6 +10,7 @@ Two rules hold throughout this module, both from findings #7 and #10:
 """
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -240,9 +241,20 @@ def _insert(exif: dict, path: Path):
     `piexif.dump` can reject an IFD that loaded cleanly — an out-of-range
     value, or a tag whose type it will not re-encode. Doing the dump before
     opening the file for write keeps a failure from truncating the original.
+
+    The rewrite preserves mtime. `piexif.insert` replaces the file in place,
+    so without this every EXIF write restamps it with the moment of the write:
+    a photo whose own EXIF reads 2018 would report as modified today, and
+    anything that sorts or groups by mtime would file it under the ingest date.
+    Callers that know the capture instant overwrite the mtime afterwards; the
+    rest keep whatever the file already carried. Preserving here rather than in
+    the callers matters because a sidecar with both a date and GPS writes
+    twice, and the second write would otherwise undo the first one's mtime.
     """
     exif_bytes = piexif.dump(exif)
+    before = path.stat()
     piexif.insert(exif_bytes, str(path))
+    os.utime(path, (before.st_atime, before.st_mtime))
 
 
 def has_metadata(path: Path) -> dict:

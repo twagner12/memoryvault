@@ -155,6 +155,83 @@ class TestVideoMtimeFallback:
         assert outcome.merged_mtime_only == []
 
 
+class TestMtimeTracksCaptureTime:
+    """An EXIF write must not leave the file stamped with the moment of ingest.
+
+    `piexif.insert` rewrites in place, so before this was pinned every JPEG the
+    pipeline dated came out with an mtime of "now" while its own EXIF said
+    otherwise — 62,409 files in the production vault, two thirds of it. mtime is
+    format-agnostic and the capture instant is already in hand at the point of
+    the write, so the two should agree rather than contradict each other.
+    """
+
+    def test_exif_write_sets_mtime_to_the_capture_instant(self, tmp_path, db):
+        path = tmp_path / "p.jpg"
+        path.write_bytes(make_jpeg_bytes())
+
+        apply_sidecar(path, sidecar(**CHICAGO), db, "takeout:p.jpg")
+
+        assert int(path.stat().st_mtime) == CHICAGO_UTC
+
+    def test_mtime_is_not_the_moment_of_the_write(self, tmp_path, db):
+        """The failure this pins is silent: the file is valid, just misdated."""
+        path = tmp_path / "p.jpg"
+        path.write_bytes(make_jpeg_bytes())
+
+        apply_sidecar(path, sidecar(**CHICAGO), db, "takeout:p.jpg")
+
+        now = datetime.now(timezone.utc).timestamp()
+        assert abs(path.stat().st_mtime - now) > 86_400
+
+    def test_gps_write_does_not_undo_the_date_mtime(self, tmp_path, db):
+        """GPS is applied after the date and rewrites the same file.
+
+        This is why the preservation lives in `_insert` rather than only in the
+        date path — the second write would otherwise restamp the file and quietly
+        undo the first.
+        """
+        path = tmp_path / "p.jpg"
+        path.write_bytes(make_jpeg_bytes())
+
+        outcome = apply_sidecar(path, sidecar(**CHICAGO), db, "takeout:p.jpg")
+
+        assert "gps" in outcome.merged          # the second write really ran
+        assert int(path.stat().st_mtime) == CHICAGO_UTC
+
+    def test_gps_only_write_preserves_the_existing_mtime(self, tmp_path, db):
+        """No date offered, so nothing knows the capture instant — but the write
+        must still not restamp the file with the wall clock."""
+        path = tmp_path / "p.jpg"
+        path.write_bytes(make_jpeg_bytes())
+        os.utime(path, (1_000_000_000, 1_000_000_000))
+
+        apply_sidecar(path, sidecar(utc_epoch=None, **CHICAGO), db,
+                      "takeout:p.jpg")
+
+        assert int(path.stat().st_mtime) == 1_000_000_000
+
+    def test_embedded_date_and_mtime_describe_the_same_instant(self, tmp_path, db):
+        """DateTimeOriginal is local wall clock; mtime is the same moment in UTC.
+
+        CHICAGO_UTC is 2021-07-04 18:00 UTC, which is 13:00 CDT.
+        """
+        path = tmp_path / "p.jpg"
+        path.write_bytes(make_jpeg_bytes())
+
+        apply_sidecar(path, sidecar(**CHICAGO), db, "takeout:p.jpg")
+
+        exif = piexif.load(str(path))
+        dto = exif["Exif"][piexif.ExifIFD.DateTimeOriginal].decode()
+        assert dto == "2021:07:04 13:00:00"
+        assert int(path.stat().st_mtime) == CHICAGO_UTC
+
+    def test_non_exif_container_is_unchanged(self, tmp_path, db, small_mp4):
+        """The mtime path already did this; it must keep doing it."""
+        apply_sidecar(small_mp4, sidecar(), db, "takeout:v.mp4")
+
+        assert int(small_mp4.stat().st_mtime) == CHICAGO_UTC
+
+
 class TestUtcFallbackDualState:
     def test_date_is_written_and_flagged(self, tmp_path, db):
         """No GPS, no sibling: write UTC but record that it was assumed."""
