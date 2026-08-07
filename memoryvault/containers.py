@@ -69,6 +69,18 @@ class Container(Enum):
 # than a method on the enum so the claim is stated in exactly one place.
 _EXIF_WRITABLE = frozenset({Container.JPEG, Container.WEBP})
 
+# Reading is a weaker requirement than writing, and conflating them cost us:
+# `_merge_from_source_file` gated on the WRITE set, so a discarded HEIC
+# duplicate was never read for the date it might carry — 18,676 files in the
+# vault. piexif cannot reach HEIF, but pillow-heif can, and it is a declared
+# dependency.
+_EXIF_READABLE = frozenset({Container.JPEG, Container.WEBP, Container.HEIF})
+
+
+def supports_exif_read(container: Container) -> bool:
+    """True when this container's EXIF can be READ. Superset of supports_exif."""
+    return container in _EXIF_READABLE
+
 
 def supports_exif(container: Container) -> bool:
     """True only where piexif can embed EXIF.

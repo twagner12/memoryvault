@@ -16,7 +16,9 @@ from pathlib import Path
 
 import piexif
 
-from memoryvault.containers import detect_container, supports_exif
+from memoryvault.containers import (
+    detect_container, supports_exif, supports_exif_read,
+)
 
 # Extensions that *hint* at an EXIF-capable file. Kept only for cheap
 # pre-filtering where no bytes are available; `can_have_exif` is the
@@ -48,6 +50,44 @@ def can_have_exif(path: Path) -> bool:
         return False
 
 
+def can_read_exif(path: Path) -> bool:
+    """True when this file's EXIF can be read — a weaker test than writing it.
+
+    Kept separate from `can_have_exif` on purpose. Gating a read on the write
+    predicate is what caused every discarded HEIC duplicate to be thrown away
+    unread: 18,676 files whose date and GPS were never even looked at.
+    """
+    try:
+        return supports_exif_read(detect_container(path))
+    except OSError:
+        return False
+
+
+def _read_heif_exif(path: Path) -> dict | None:
+    """HEIF EXIF, shaped exactly like piexif.load returns.
+
+    Returning piexif's own structure means every existing consumer —
+    get_exif_date, get_exif_gps, get_exif_offset — works on HEIC with no change
+    at all. pillow-heif is a declared dependency; if it is somehow missing, a
+    HEIC simply reads as "no metadata", which is the old behaviour.
+    """
+    try:
+        import pillow_heif
+        from PIL import Image
+        pillow_heif.register_heif_opener()
+        with Image.open(path) as im:
+            raw = im.info.get("exif")
+        if not raw:
+            return None
+        # PIL hands back the EXIF blob with a leading "Exif\x00\x00" marker
+        # that piexif.load does not expect from a bare byte string.
+        if raw[:6] == b"Exif\x00\x00":
+            raw = raw[6:]
+        return piexif.load(raw)
+    except Exception:
+        return None
+
+
 def read_exif(path: Path) -> dict | None:
     """Read EXIF data from an image file. Returns None if not readable.
 
@@ -55,12 +95,18 @@ def read_exif(path: Path) -> dict | None:
     legitimate answer of "no metadata". Writes use `_load_exif_for_write`,
     which distinguishes the two.
     """
-    if not can_have_exif(path):
-        return None
     try:
-        return piexif.load(str(path))
-    except Exception:
+        container = detect_container(path)
+    except OSError:
         return None
+    if supports_exif(container):
+        try:
+            return piexif.load(str(path))
+        except Exception:
+            return None
+    if supports_exif_read(container):
+        return _read_heif_exif(path)
+    return None
 
 
 def _load_exif_for_write(path: Path) -> dict:

@@ -53,7 +53,8 @@ REPORTING_COMMANDS = ["volumes", "stats", "pending", "unmatched", "dupes"]
 
 # Commands that legitimately write; listed so a new command added to the CLI
 # without a decision about which side it falls on shows up as a test failure.
-WRITE_COMMANDS = ["scan", "ingest", "merge", "migrate", "rebind", "repair-mtime"]
+WRITE_COMMANDS = ["scan", "ingest", "merge", "migrate", "rebind", "repair-mtime",
+                  "ingest-folder", "classify"]
 
 
 def _digest(path: Path) -> str:

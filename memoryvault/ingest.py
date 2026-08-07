@@ -20,7 +20,7 @@ from memoryvault.containers import detect_container, supports_exif
 from memoryvault.database import Database
 from memoryvault.hasher import hash_bytes, hash_full, hash_head, hash_tail
 from memoryvault.metadata import (
-    UnparseableExifError, can_have_exif, has_metadata,
+    UnparseableExifError, can_have_exif, can_read_exif, has_metadata,
     get_exif_date, get_exif_gps,
     write_exif_date, write_exif_gps,
 )
@@ -988,7 +988,9 @@ def _merge_from_source_file(target: Path, source: Path, db: Database,
     """
     from datetime import datetime
 
-    if not can_have_exif(source):
+    # The READ predicate, not the write one. Gating this on what piexif can
+    # write meant every discarded HEIC duplicate was thrown away unread.
+    if not can_read_exif(source):
         return
 
     offer: dict = {"utc_epoch": None, "lat": None, "lon": None}

@@ -111,6 +111,53 @@ CREATE TABLE IF NOT EXISTS sidecars_unmatched (
     rebound_path    TEXT,            -- vault file it finally bound to
     rebound_outcome TEXT             -- JSON: what applying it actually did
 );
+
+-- What happened when a byte-identical incoming file was discarded.
+--
+-- Dedup used to collapse a duplicate and record only that it had: the survivor
+-- it matched was never written down (all 952 Phase 2 rows carry kept_path
+-- NULL), and any information the duplicate held that the survivor lacked was
+-- either merged silently or lost silently. This is the metadata_pending
+-- treatment applied to dedup: every rule that runs writes into `adopted` or
+-- into `declined`, so an empty pair is a bug rather than an absence of news.
+CREATE TABLE IF NOT EXISTS dedup_collapse (
+    id              INTEGER PRIMARY KEY,
+    archive_id      INTEGER REFERENCES archives(id),
+    entry_path      TEXT NOT NULL,   -- the discarded file, as named at source
+    source_root     TEXT,            -- which drive it came from; Phase 7 erases this
+    survivor_path   TEXT NOT NULL,   -- the link that used to be missing
+    survivor_blake3 TEXT,
+    matched_on      TEXT NOT NULL,   -- 'blake3_full' | 'source_blake3'
+    adopted         TEXT,            -- JSON: what was taken, and from where
+    declined        TEXT,            -- JSON: what was offered and refused, with reasons
+    collapsed_at    TEXT NOT NULL,
+    UNIQUE(archive_id, entry_path)
+);
+
+-- A statement about ONE file: is it a camera original, a derivative of one,
+-- not a photograph at all, or undecidable. Never a claim that two files are
+-- the same photo — the measurements say that linkage is not reliably decidable
+-- in this corpus, while classification is.
+--
+-- Deliberately not `resolutions`, which adjudicates BETWEEN files on
+-- blake3_full with a winner_path and an action. Forcing this into that shape
+-- would mean inventing a winner and a group that do not exist, and is_resolved()
+-- would then mistake a classification for a dedup verdict.
+CREATE TABLE IF NOT EXISTS file_class (
+    id            INTEGER PRIMARY KEY,
+    file_id       INTEGER REFERENCES files(id),
+    path          TEXT NOT NULL,   -- denormalised; survives a re-index
+    verdict       TEXT NOT NULL,   -- original|derivative|non_photographic|unknown
+    reason        TEXT NOT NULL,   -- which rule decided
+    confidence    TEXT NOT NULL,   -- high|medium|low
+    -- Every signal EVALUATED, not merely the one that fired, so a future rule
+    -- can be tried against the residual from this column alone rather than by
+    -- re-reading 99k files.
+    evidence      TEXT NOT NULL,
+    classifier    TEXT NOT NULL,   -- version, so two runs stay comparable
+    classified_at TEXT NOT NULL,
+    UNIQUE(path, classifier)
+);
 """
 
 # Applied after column migrations: on an older database the columns these
@@ -125,6 +172,8 @@ CREATE INDEX IF NOT EXISTS idx_resolutions_blake3 ON resolutions(blake3_full);
 CREATE INDEX IF NOT EXISTS idx_pending_outstanding
     ON metadata_pending(state, applied_at);
 CREATE INDEX IF NOT EXISTS idx_pending_path ON metadata_pending(file_path);
+CREATE INDEX IF NOT EXISTS idx_collapse_survivor ON dedup_collapse(survivor_path);
+CREATE INDEX IF NOT EXISTS idx_file_class_verdict ON file_class(verdict);
 CREATE INDEX IF NOT EXISTS idx_unmatched_rebind
     ON sidecars_unmatched(rebound_at, archive_dir, media_stem);
 """
