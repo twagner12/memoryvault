@@ -25,14 +25,14 @@ from memoryvault.cli import cli
 from memoryvault.database import Database
 from memoryvault.hasher import hash_full, hash_head, hash_tail
 from memoryvault.repair import (
-    INGEST_WINDOW, find_candidates, load_google_epochs, repair_mtimes,
+    TAKEOUT_INGEST_WINDOW, find_candidates, load_google_epochs, repair_mtimes,
     resolve_instant,
 )
 from tests.conftest import make_jpeg_bytes
 
 # 2021-07-04 18:00:00 UTC == 13:00:00 in Chicago (CDT, -05:00).
 CAPTURE_UTC = int(datetime(2021, 7, 4, 18, 0, 0, tzinfo=timezone.utc).timestamp())
-IN_WINDOW = INGEST_WINDOW[0] + 3600          # inside the Aug 2026 ingest run
+IN_WINDOW = TAKEOUT_INGEST_WINDOW[0] + 3600          # inside the Aug 2026 ingest run
 
 
 def jpeg_with(tmp_path, name, dto="2021:07:04 13:00:00", offset=b"-05:00"):

@@ -13,6 +13,7 @@ from memoryvault.ingest import (
     ingest_archive, merge_metadata_between_files, scratch_path,
 )
 from memoryvault.rebind import rebind_sidecars
+from memoryvault.folder import ingest_folder
 from memoryvault.repair import repair_mtimes
 from memoryvault.volumes import UnreachableVolumeError, find_unreachable_volumes
 
@@ -342,6 +343,76 @@ def rebind(ctx, dry_run):
 
         if dry_run:
             click.echo("\nDry run — nothing was written.")
+    finally:
+        db.close()
+
+
+@cli.command("ingest-folder")
+@click.argument("folder", type=click.Path(exists=True, file_okay=False,
+                                          resolve_path=True))
+@click.option("--dest", required=True,
+              type=click.Path(file_okay=False, resolve_path=True),
+              help="Destination folder for unique files.")
+@click.option("--apply", "apply_changes", is_flag=True,
+              help="Actually copy and write. Without this the command only "
+                   "reports: the default is a dry run.")
+@click.option("--limit", default=0, help="Process at most this many files.")
+@click.option("--allow-unreachable-volumes", is_flag=True)
+@click.option("--sample", default=15, help="Rows to print per section.")
+@click.pass_context
+def ingest_folder_cmd(ctx, folder, dest, apply_changes, limit,
+                      allow_unreachable_volumes, sample):
+    """Ingest a folder tree into the vault, deduplicating against it.
+
+    Files are COPIED. Nothing under the source folder is ever moved, renamed or
+    deleted — that is what separates this from the archive path, whose entries
+    are scratch files it owns.
+
+    Every collapsed duplicate is recorded in dedup_collapse with what was taken
+    from it and what was refused, so a discarded file cannot take information
+    with it unnoticed.
+
+    Dry run by default. Pass --apply to write.
+    """
+    dry_run = not apply_changes
+    db = Database(ctx.obj["db_path"], read_only=dry_run)
+    try:
+        def progress(done, total):
+            click.echo(f"  {done:,}/{total:,}", nl=False)
+            click.echo("\r", nl=False)
+
+        stats = ingest_folder(Path(folder), Path(dest), db, dry_run=dry_run,
+                              limit=limit, progress=progress,
+                              allow_unreachable_volumes=allow_unreachable_volumes)
+
+        verb = "Would keep" if dry_run else "Kept"
+        click.echo(f"\nSource files found: {stats['total_files_seen']:,}")
+        click.echo(f"Examined:           {stats['seen']:,}")
+        click.echo(f"{verb}:          {stats['kept']:,}")
+        click.echo(f"Collapsed as duplicate: {stats['collapsed']:,}")
+        click.echo(f"  of those adopting the source's mtime: "
+                   f"{stats['adopted_mtime']:,}")
+        click.echo(f"Sidecars/metadata skipped: {stats['skipped']:,}")
+        click.echo(f"Errors:             {stats['errors']:,}")
+
+        if stats["kept_examples"]:
+            click.echo(f"\nWould keep (first {min(sample, len(stats['kept_examples']))}):")
+            for e in stats["kept_examples"][:sample]:
+                click.echo(f"  {e['entry'][:58]:<60} -> {Path(e['dest']).name}")
+
+        if stats["collapses"]:
+            click.echo(f"\nCollapses (first {min(sample, len(stats['collapses']))}):")
+            for c in stats["collapses"][:sample]:
+                click.echo(f"  {c['entry'][:56]:<58} == {Path(c['survivor']).name}")
+                for a in c["adopted"]:
+                    click.echo(f"      ADOPT   {a['what']:<12} {a['detail'][:60]}")
+                for d in c["declined"]:
+                    click.echo(f"      decline {d['what']:<12} {d['reason']} "
+                               f"{d['detail'][:44]}")
+
+        if dry_run:
+            click.echo("\nDry run — nothing copied, nothing written. "
+                       "Pass --apply to write.")
     finally:
         db.close()
 

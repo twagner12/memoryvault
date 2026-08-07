@@ -35,9 +35,15 @@ import piexif
 from memoryvault.hasher import hash_full, hash_head, hash_tail
 from memoryvault.metadata import read_exif
 
-# The August 2026 ingest run. Files outside it were not clobbered by ingest and
-# may be carrying a legitimate value, so they are never touched.
-INGEST_WINDOW = (
+# The August 2026 Takeout run, and nothing else. Named for the event it
+# describes rather than for "ingest" generally, because it is a historical fact
+# with an end date, not a maintained property of the system.
+#
+# Folder ingest does not extend it: shutil.copy2 preserves the source mtime and
+# the kept path never writes EXIF, so nothing it does clobbers a timestamp.
+# Prefer `mtime_matches_own_exif` over this window wherever the file carries a
+# date of its own — see folder.mtime_verdict.
+TAKEOUT_INGEST_WINDOW = (
     datetime(2026, 8, 3, tzinfo=timezone.utc).timestamp(),
     datetime(2026, 8, 6, tzinfo=timezone.utc).timestamp(),
 )
@@ -184,7 +190,7 @@ def load_google_epochs(db) -> dict:
     return out
 
 
-def find_candidates(db, window=INGEST_WINDOW) -> list:
+def find_candidates(db, window=TAKEOUT_INGEST_WINDOW) -> list:
     """Files whose mtime sits inside the ingest window. Cheap: DB only."""
     lo, hi = window
     rows = db.conn.execute(
@@ -327,3 +333,32 @@ def repair_mtimes(db, *, dry_run=True, limit=0, verify_hash=True,
                   f"skipped {stats['skipped']:,}\n")
         log.close()
     return stats
+
+
+def mtime_matches_own_exif(path) -> bool | None:
+    """Does this file's mtime correspond to its own capture date?
+
+    True  — the gap is a legal UTC offset, so the mtime describes the capture.
+    False — the gap is not any offset that exists, so the mtime is an artefact.
+    None  — the file carries no date to check against; the caller must fall back
+            to something else.
+
+    This is strictly better than asking whether an mtime falls inside a known
+    ingest window: it is a property of the file rather than of one historical
+    run, so it recognises a timestamp clobbered by anything, at any time, and it
+    cannot go stale.
+    """
+    from memoryvault.metadata import can_read_exif, get_exif_date
+    if not can_read_exif(path):
+        return None
+    iso = get_exif_date(path)
+    if not iso:
+        return None
+    try:
+        naive = datetime.fromisoformat(iso).replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+    try:
+        return _is_legal_utc_offset(path.stat().st_mtime - naive)
+    except OSError:
+        return None
