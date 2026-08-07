@@ -165,6 +165,38 @@ class TestDateWitnessCompetence:
         assert is_competent_date_witness(stripped)[0] is True
 
 
+class TestDimsErrorMeansWhatItSays:
+    """dims_error must mean "this file should have had readable pixels and did
+    not". Attempting PIL on video raised UnidentifiedImageError and recorded it
+    on 12,125 videos, which made the field useless: a reader would conclude
+    12,125 images had failed to decode when none had."""
+
+    def test_video_is_not_attempted_and_records_no_error(self, tmp_path):
+        from memoryvault.classify import rows_from_vault
+        v = tmp_path / "vault"
+        v.mkdir()
+        (v / "clip.MOV").write_bytes(b"\x00\x00\x00\x18ftypqt  " + b"\x00" * 64)
+
+        rec = rows_from_vault(v)[0]
+
+        assert rec["width"] is None
+        assert rec["dims_error"] is None      # absence of pixels, not a failure
+
+    def test_an_image_that_cannot_decode_does_record_one(self, tmp_path):
+        from memoryvault.classify import rows_from_vault
+        v = tmp_path / "vault"
+        v.mkdir()
+        # A valid JPEG header with no decodable scan — the shape of the five
+        # damaged Kodak/Nikon files.
+        (v / "broken.jpg").write_bytes(b"\xff\xd8\xff\xe1" + b"\x00" * 512)
+
+        rec = rows_from_vault(v)[0]
+
+        assert rec["width"] is None
+        assert rec["dims_error"] is not None
+        assert "Error" in rec["dims_error"]
+
+
 class TestVerdictDomain:
     def test_every_verdict_is_one_of_the_four(self):
         for r in (NIKON_DOWNSCALE, IPHONE_ORIGINAL, THUMBNAIL, INSTAGRAM,

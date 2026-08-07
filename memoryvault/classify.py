@@ -84,6 +84,13 @@ UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 COLLISION_RE = re.compile(r"(\(\d+\))+$")
 
+# Containers PIL cannot decode by design. Attempting them anyway raises
+# UnidentifiedImageError, which would then be recorded as `dims_error` on
+# 12,125 video files and make the field mean nothing: a reader glancing at it
+# would conclude 12,125 images had failed to decode, when in fact none had.
+# dims_error must mean "this file should have had readable pixels and did not".
+NO_PIXELS_CONTAINERS = {"mov", "mp4", "unknown", "unreadable"}
+
 TINY_PIXELS = 500_000
 ORIGINAL_PIXELS = 2_000_000
 MIN_CAMERA_PIXELS = 500_000
@@ -256,16 +263,19 @@ def rows_from_vault(vault: Path, progress=None) -> list:
             return v
         w = h = None
         dims_error = None
-        try:
-            with Image.open(p) as im:
-                w, h = im.size
-        except Exception as exc:
-            # Not swallowed: the reason is carried into the record so it reaches
-            # `evidence`, where it explains a `has_pixels: False` that would
-            # otherwise look like a file with no dimensions rather than a file
-            # whose dimensions could not be read.
-            dims_error = f"{type(exc).__name__}: {exc}"[:120]
-            logger.debug("no dimensions for %s: %s", p, exc)
+        # Video is not attempted at all. It has no still frame to measure, so
+        # trying would raise and be recorded as a failure that never happened.
+        if container not in NO_PIXELS_CONTAINERS:
+            try:
+                with Image.open(p) as im:
+                    w, h = im.size
+            except Exception as exc:
+                # Not swallowed: the reason is carried into the record so it
+                # reaches `evidence`, where it explains a has_pixels:False that
+                # would otherwise look like a file with no dimensions rather
+                # than a file whose dimensions could not be read.
+                dims_error = f"{type(exc).__name__}: {exc}"[:120]
+                logger.debug("no dimensions for %s: %s", p, exc)
         out.append({
             "path": path, "name": p.name, "container": container,
             "width": w, "height": h,
