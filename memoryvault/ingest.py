@@ -704,6 +704,15 @@ def _apply_date_to_exif(path: Path, capture, utc_epoch: int, db: Database,
         outcome.failed.append("date")
         return
 
+    # The EXIF write rewrote the file. `_insert` kept the mtime it had, but
+    # that is the moment of extraction, not of capture — so set it. mtime is
+    # format-agnostic and the instant is already in hand, which makes this the
+    # cheapest possible way to stop a dated photo reading as modified today.
+    # utc_epoch rather than the local wall clock: mtime is an absolute instant,
+    # the same reasoning as `_apply_date_as_mtime`. The EXIF value remains the
+    # stronger claim; this only keeps the weaker one from contradicting it.
+    os.utime(path, (utc_epoch, utc_epoch))
+
     db.log_metadata_merge(str(path), source_desc, "date", payload)
     outcome.merged.append("date")
 
