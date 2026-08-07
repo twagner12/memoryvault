@@ -1,5 +1,6 @@
 """MemoryVault CLI — scan folders and find duplicates."""
 
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -12,6 +13,7 @@ from memoryvault.ingest import (
     ingest_archive, merge_metadata_between_files, scratch_path,
 )
 from memoryvault.rebind import rebind_sidecars
+from memoryvault.repair import repair_mtimes
 from memoryvault.volumes import UnreachableVolumeError, find_unreachable_volumes
 
 
@@ -340,6 +342,97 @@ def rebind(ctx, dry_run):
 
         if dry_run:
             click.echo("\nDry run — nothing was written.")
+    finally:
+        db.close()
+
+
+@cli.command("repair-mtime")
+@click.option("--apply", "apply_changes", is_flag=True,
+              help="Actually write. Without this the command only reports: the "
+                   "default is a dry run, so the direction that modifies "
+                   "62,409 files is the one that needs the flag.")
+@click.option("--limit", default=0,
+              help="Repair at most this many files (0 = all).")
+@click.option("--no-verify-hash", is_flag=True,
+              help="Skip the content check entirely. Only honoured on a dry "
+                   "run; --apply always guards.")
+@click.option("--full-hash", is_flag=True,
+              help="Guard by re-hashing every byte instead of size plus 64 KB "
+                   "head and 4 KB tail. ~200 GiB rather than ~3.5 GiB across "
+                   "the vault, over an enclosure that has already faulted "
+                   "twice. Only worth it against mid-file corruption that "
+                   "leaves size intact.")
+@click.option("--log", "log_path", default=None,
+              help="Append every change to this file: path, old mtime, new "
+                   "mtime, and where the value came from.")
+@click.option("--sample", default=20, help="Before/after rows to print.")
+@click.pass_context
+def repair_mtime(ctx, apply_changes, limit, no_verify_hash, full_hash,
+                 log_path, sample):
+    """Set mtimes that ingest stamped with its own run time.
+
+    Ingest rewrote files in place without restoring mtime, so files it touched
+    claim they were modified during the run while their own EXIF says
+    otherwise. This sets mtime to the instant the file's own metadata
+    describes. Content is never altered, so every hash stays valid.
+
+    The value comes from the file's own EXIF wherever that resolves to an
+    absolute instant. Google's recorded timestamp is used only where it
+    corroborates the file rather than contradicting it — a file that arrived
+    with its own date got no write precisely because it knew better, and
+    Google's photoTakenTime is not reliable enough to overwrite that.
+
+    Dry run by default. Pass --apply to write.
+    """
+    dry_run = not apply_changes
+    # The content guard is never waived on a real run, whatever was asked for.
+    verify_hash = True if apply_changes else not no_verify_hash
+
+    db = Database(ctx.obj["db_path"], read_only=dry_run)
+    try:
+        def progress(done, total):
+            click.echo(f"  {done:,} processed", nl=False)
+            click.echo("\r", nl=False)
+
+        stats = repair_mtimes(db, dry_run=dry_run, limit=limit,
+                              verify_hash=verify_hash, full_hash=full_hash,
+                              log_path=log_path, progress=progress)
+
+        verb = "Would set" if dry_run else "Set"
+        n = stats["would_repair"] if dry_run else stats["repaired"]
+        click.echo(f"\nCandidates in the ingest window: {stats['candidates']:,}")
+        click.echo(f"{verb} mtime on {n:,} file(s).")
+
+        if stats["by_source"]:
+            click.echo("\nWhere the value came from:")
+            for k, v in sorted(stats["by_source"].items(), key=lambda kv: -kv[1]):
+                click.echo(f"  {v:>8,}  {k}")
+
+        if stats["by_skip"]:
+            click.echo(f"\nSkipped {stats['skipped']:,}:")
+            for k, v in sorted(stats["by_skip"].items(), key=lambda kv: -kv[1]):
+                click.echo(f"  {v:>8,}  {k}")
+
+        if sample and stats["changes"]:
+            click.echo(f"\nFirst {min(sample, len(stats['changes']))} "
+                       f"before/after:")
+            for p, old, new, src, _ in stats["changes"][:sample]:
+                click.echo(f"  {Path(p).name[:38]:<38} "
+                           f"{datetime.fromtimestamp(old):%Y-%m-%d %H:%M} -> "
+                           f"{datetime.fromtimestamp(new):%Y-%m-%d %H:%M}  [{src}]")
+
+        interesting = [s for s in stats["skips"]
+                       if s[1] in ("hash_mismatch", "google_contradicts_exif",
+                                   "file_missing")]
+        if interesting:
+            click.echo(f"\nSkips worth reading ({len(interesting)}):")
+            for p, why, detail in interesting[:20]:
+                click.echo(f"  {why:<26} {Path(p).name[:34]}")
+                if detail:
+                    click.echo(f"      {detail}")
+
+        if dry_run:
+            click.echo("\nDry run — nothing was written. Pass --apply to write.")
     finally:
         db.close()
 
