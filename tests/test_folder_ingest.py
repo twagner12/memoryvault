@@ -111,6 +111,23 @@ class TestDryRun:
             "SELECT COUNT(*) c FROM dedup_collapse").fetchone()["c"] == 0
 
 
+class TestNonMediaIsNotIngested:
+    def test_camera_droppings_are_skipped_not_copied(self, db, vault, source):
+        """Sony .modd, Apple .aae and .orig backups sit beside real photos on a
+        camera-sourced folder. The archive path already excludes them; so must
+        this one, or they enter the vault as if they were photographs."""
+        jpeg(source / "DSC_0001.JPG")
+        for junk in ("DSC_0001.modd", "DSC_0001.aae", "DSC_0001.orig",
+                     "album.zip", "profile.cxf", "no_extension_at_all"):
+            (source / junk).write_bytes(b"not a photograph")
+
+        stats = ingest_folder(source, vault, db, dry_run=False)
+
+        assert stats["kept"] == 1
+        assert stats["skip_reasons"]["not_media"] == 6
+        assert [p.name for p in vault.iterdir()] == ["DSC_0001.JPG"]
+
+
 class TestKeeping:
     def test_unique_file_is_copied_and_indexed(self, db, vault, source):
         src = jpeg(source / "sub" / "one.jpg")

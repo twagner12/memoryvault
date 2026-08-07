@@ -33,7 +33,7 @@ from memoryvault.database import Database
 from memoryvault.hasher import hash_full
 from memoryvault.ingest import (
     _index_saved_file, _try_merge_from_duplicate, _unique_dest_path,
-    is_metadata_json, is_sidecar_json,
+    is_media_file, is_metadata_json, is_sidecar_json,
 )
 from memoryvault.metadata import can_read_exif, get_exif_date
 from memoryvault.repair import (
@@ -251,7 +251,8 @@ def ingest_folder(src_root: Path, dest: Path, db: Database, *, dry_run=True,
         assert_volumes_reachable(db, override_hint="--allow-unreachable-volumes")
 
     stats = {"seen": 0, "kept": 0, "collapsed": 0, "skipped": 0, "errors": 0,
-             "adopted_mtime": 0, "collapses": [], "kept_examples": []}
+             "adopted_mtime": 0, "collapses": [], "kept_examples": [],
+             "skip_reasons": {}, "skipped_examples": []}
 
     archive_id = None
     if not dry_run:
@@ -276,9 +277,27 @@ def ingest_folder(src_root: Path, dest: Path, db: Database, *, dry_run=True,
 
         if is_metadata_json(sf.rel) or is_sidecar_json(sf.rel):
             stats["skipped"] += 1
+            stats["skip_reasons"]["sidecar"] = \
+                stats["skip_reasons"].get("sidecar", 0) + 1
             if not dry_run:
                 db.log_archive_entry(archive_id, sf.rel, "skipped",
                                      skip_reason="sidecar")
+            continue
+
+        # The same predicate the archive path uses, so a camera's own droppings
+        # — Sony .modd, Apple .aae edit sidecars, .orig backups — do not enter
+        # the vault as if they were photographs. Extension-based, which is safe
+        # for exclusion even though extensions lie for 28.8% of the vault: a
+        # .modd is never a JPEG in disguise.
+        if not is_media_file(sf.rel):
+            stats["skipped"] += 1
+            stats["skip_reasons"]["not_media"] = \
+                stats["skip_reasons"].get("not_media", 0) + 1
+            if len(stats["skipped_examples"]) < 200:
+                stats["skipped_examples"].append((sf.rel, "not_media"))
+            if not dry_run:
+                db.log_archive_entry(archive_id, sf.rel, "skipped",
+                                     skip_reason="not_media")
             continue
 
         try:

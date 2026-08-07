@@ -467,7 +467,10 @@ def ingest_folder_cmd(ctx, folder, dest, apply_changes, limit,
         click.echo(f"Collapsed as duplicate: {stats['collapsed']:,}")
         click.echo(f"  of those adopting the source's mtime: "
                    f"{stats['adopted_mtime']:,}")
-        click.echo(f"Sidecars/metadata skipped: {stats['skipped']:,}")
+        click.echo(f"Skipped:            {stats['skipped']:,}")
+        for reason, n in sorted(stats["skip_reasons"].items(),
+                                key=lambda kv: -kv[1]):
+            click.echo(f"  {n:>8,}  {reason}")
         click.echo(f"Errors:             {stats['errors']:,}")
 
         if stats["kept_examples"]:
