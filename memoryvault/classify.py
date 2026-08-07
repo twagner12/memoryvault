@@ -42,7 +42,12 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-CLASSIFIER_VERSION = "g1-2026-08-06"
+# Bumped from "g1-2026-08-06" when the reader changed, not the rules. That
+# earlier version's rows were derived from date-provenance.csv; these are read
+# live from the files. Same logic, different witness — and UNIQUE(path,
+# classifier) means a bump keeps both, so any drift between the two readers
+# stays visible instead of being silently overwritten.
+CLASSIFIER_VERSION = "g1-live-2026-08-06"
 
 VERDICTS = ("original", "derivative", "non_photographic", "unknown")
 
@@ -82,6 +87,35 @@ COLLISION_RE = re.compile(r"(\(\d+\))+$")
 TINY_PIXELS = 500_000
 ORIGINAL_PIXELS = 2_000_000
 MIN_CAMERA_PIXELS = 500_000
+
+
+def is_competent_date_witness(rec: dict) -> tuple:
+    """Is this file's EXIF DateTimeOriginal evidence about when it was captured?
+
+    Returns (competent, reason).
+
+    Not every DateTimeOriginal is a capture time. A processing tool can write
+    one, and then the field records when the TOOL ran — which is worthless as a
+    witness and actively misleading when used to check something else against.
+
+    The tell is a file carrying no camera Make or Model while naming a
+    third-party tool in Software. A camera always identifies itself; a tool
+    that strips the camera tags and leaves its own name behind is describing
+    its own run. Three vault files match exactly this shape and all three claim
+    a DateTimeOriginal of 2023-02-27 20:52 — the timestamp of a restore, two of
+    them identical to the second.
+
+    This is the general form of what finding 8 says about Google's import
+    dates. It matters for every remaining source, because every source has been
+    through some tool.
+    """
+    make, model = rec.get("make"), rec.get("model")
+    if make or model:
+        return True, "camera_identified"
+    software = str(rec.get("software") or "")
+    if software and APP_RE.search(software):
+        return False, f"no_camera_tags_and_software_is_{software.split()[0].lower()}"
+    return True, "no_camera_tags_but_nothing_claims_authorship"
 
 
 def _stem(name):

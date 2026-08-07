@@ -20,7 +20,7 @@ import pytest
 
 from memoryvault.classify import (
     CLASSIFIER_VERSION, VERDICTS, classify_all, classify_record, gather_signals,
-    write_verdicts,
+    is_competent_date_witness, write_verdicts,
 )
 
 
@@ -132,6 +132,37 @@ class TestEvidenceRecordsEverySignal:
         _, _, _, ev = classify_record(VIDEO)
         assert ev["px"] is None and ev["aspect"] is None and ev["max_dim"] is None
         assert ev["tests"]["has_pixels"] is False
+
+
+class TestDateWitnessCompetence:
+    """A DateTimeOriginal written by a tool is not evidence about capture."""
+
+    def test_a_camera_is_a_competent_witness(self):
+        ok, reason = is_competent_date_witness(IPHONE_ORIGINAL)
+        assert ok and reason == "camera_identified"
+
+    def test_no_camera_tags_plus_a_tool_name_is_not(self):
+        """The three files that failed the _iOS convention guard: no Make or
+        Model, Software says Picasa, and DateTimeOriginal is the restore's
+        own timestamp."""
+        restored = rec("20160106_011830000_iOS.jpg", width=3264, height=2448,
+                       software="Picasa")
+        ok, reason = is_competent_date_witness(restored)
+        assert not ok
+        assert "picasa" in reason
+
+    def test_a_camera_that_also_used_a_tool_stays_competent(self):
+        """Software alone does not disqualify — the camera tags are the point."""
+        edited = rec("IMG_1.JPG", width=4032, height=3024, make="Apple",
+                     model="iPhone 12", software="Photoshop")
+        assert is_competent_date_witness(edited)[0] is True
+
+    def test_stripped_exif_with_no_claim_of_authorship_is_not_excluded(self):
+        """Google strips camera tags without leaving its own name. Such a file
+        is weak evidence, but nothing claims to have written the date, so it is
+        not disqualified — over-broad exclusion would discard real photographs."""
+        stripped = rec("IMG_2.JPG", width=3000, height=2000)
+        assert is_competent_date_witness(stripped)[0] is True
 
 
 class TestVerdictDomain:
