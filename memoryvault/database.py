@@ -133,6 +133,31 @@ CREATE TABLE IF NOT EXISTS dedup_collapse (
     collapsed_at    TEXT NOT NULL,
     UNIQUE(archive_id, entry_path)
 );
+
+-- A statement about ONE file: is it a camera original, a derivative of one,
+-- not a photograph at all, or undecidable. Never a claim that two files are
+-- the same photo — the measurements say that linkage is not reliably decidable
+-- in this corpus, while classification is.
+--
+-- Deliberately not `resolutions`, which adjudicates BETWEEN files on
+-- blake3_full with a winner_path and an action. Forcing this into that shape
+-- would mean inventing a winner and a group that do not exist, and is_resolved()
+-- would then mistake a classification for a dedup verdict.
+CREATE TABLE IF NOT EXISTS file_class (
+    id            INTEGER PRIMARY KEY,
+    file_id       INTEGER REFERENCES files(id),
+    path          TEXT NOT NULL,   -- denormalised; survives a re-index
+    verdict       TEXT NOT NULL,   -- original|derivative|non_photographic|unknown
+    reason        TEXT NOT NULL,   -- which rule decided
+    confidence    TEXT NOT NULL,   -- high|medium|low
+    -- Every signal EVALUATED, not merely the one that fired, so a future rule
+    -- can be tried against the residual from this column alone rather than by
+    -- re-reading 99k files.
+    evidence      TEXT NOT NULL,
+    classifier    TEXT NOT NULL,   -- version, so two runs stay comparable
+    classified_at TEXT NOT NULL,
+    UNIQUE(path, classifier)
+);
 """
 
 # Applied after column migrations: on an older database the columns these
@@ -148,6 +173,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_outstanding
     ON metadata_pending(state, applied_at);
 CREATE INDEX IF NOT EXISTS idx_pending_path ON metadata_pending(file_path);
 CREATE INDEX IF NOT EXISTS idx_collapse_survivor ON dedup_collapse(survivor_path);
+CREATE INDEX IF NOT EXISTS idx_file_class_verdict ON file_class(verdict);
 CREATE INDEX IF NOT EXISTS idx_unmatched_rebind
     ON sidecars_unmatched(rebound_at, archive_dir, media_stem);
 """

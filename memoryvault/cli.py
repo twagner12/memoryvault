@@ -13,6 +13,10 @@ from memoryvault.ingest import (
     ingest_archive, merge_metadata_between_files, scratch_path,
 )
 from memoryvault.rebind import rebind_sidecars
+from memoryvault.classify import (
+    CLASSIFIER_VERSION, classify_all, rows_from_csv, rows_from_vault,
+    write_verdicts,
+)
 from memoryvault.folder import ingest_folder
 from memoryvault.repair import repair_mtimes
 from memoryvault.volumes import UnreachableVolumeError, find_unreachable_volumes
@@ -343,6 +347,77 @@ def rebind(ctx, dry_run):
 
         if dry_run:
             click.echo("\nDry run — nothing was written.")
+    finally:
+        db.close()
+
+
+@cli.command("classify")
+@click.option("--vault", required=True,
+              type=click.Path(exists=True, file_okay=False, resolve_path=True),
+              help="The vault to classify.")
+@click.option("--from-csv", "from_csv", default=None,
+              type=click.Path(exists=True, dir_okay=False),
+              help="Reuse a date-provenance.csv instead of decoding every "
+                   "image again. Much faster, and the source of the measured "
+                   "distribution.")
+@click.option("--apply", "apply_changes", is_flag=True,
+              help="Write verdicts to file_class. Without this the command "
+                   "only reports.")
+@click.option("--sample", default=5, help="Example rows per verdict.")
+@click.pass_context
+def classify_cmd(ctx, vault, from_csv, apply_changes, sample):
+    """Classify each vault file as original, derivative, non-photographic or unknown.
+
+    A statement about one file, never a claim that two files are the same photo.
+    Nothing is grouped, moved, renamed or deleted; the only output is a verdict
+    per file with the evidence behind it.
+
+    `evidence` records every signal evaluated, not only the one that decided, so
+    a later rule can be tried against the residual from the database alone.
+
+    Dry run by default. Pass --apply to write.
+    """
+    from collections import Counter
+
+    dry_run = not apply_changes
+    db = Database(ctx.obj["db_path"], read_only=dry_run)
+    try:
+        if from_csv:
+            records = rows_from_csv(from_csv)
+        else:
+            def progress(done, total):
+                click.echo(f"  reading {done:,}/{total:,}", nl=False)
+                click.echo("\r", nl=False)
+            records = rows_from_vault(Path(vault), progress=progress)
+
+        results = classify_all(records)
+        click.echo(f"\nClassified {len(results):,} file(s) "
+                   f"[{CLASSIFIER_VERSION}]\n")
+
+        counts = Counter(r["verdict"] for r in results)
+        for verdict, n in counts.most_common():
+            click.echo(f"  {n:>8,}  {100 * n / len(results):>5.1f}%  {verdict}")
+
+        click.echo("\nBy reason:")
+        for (v, reason), n in Counter(
+                (r["verdict"], r["reason"]) for r in results).most_common():
+            click.echo(f"  {n:>8,}  {v:<18} {reason}")
+
+        if sample:
+            for verdict in counts:
+                rows = [r for r in results if r["verdict"] == verdict][:sample]
+                click.echo(f"\n  {verdict}:")
+                for r in rows:
+                    e = r["evidence"]
+                    dims = (f"{e['width']}x{e['height']}" if e["width"] else "-")
+                    click.echo(f"    {r['name'][:38]:<40}{dims:>12}  "
+                               f"{e['container']:<6}{r['reason']}")
+
+        if dry_run:
+            click.echo("\nDry run — nothing written. Pass --apply to write.")
+        else:
+            written = write_verdicts(db, results)
+            click.echo(f"\nWrote {written:,} verdict(s) to file_class.")
     finally:
         db.close()
 
