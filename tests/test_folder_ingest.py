@@ -302,3 +302,72 @@ class TestWalk:
         jpeg(root / "a" / "1.jpg")
         rels = [f.rel for f in iter_source_files(root, exclude=set())]
         assert rels == [str(Path("a/1.jpg")), str(Path("b/2.jpg"))]
+
+
+class TestCrashSafety:
+    """What the 2026-09-09 hot-unplug did to a b12 run, replayed.
+
+    A crash can lose a saved file's directory entry after its row committed.
+    The row survives, claiming a path with nothing at it. Two things must then
+    hold: an unrelated file with the same name must not take that path (the
+    upsert would overwrite the lost file's row and drop it from the index), and
+    the lost content, arriving again, must go back where its row says it lives.
+    """
+
+    def test_new_file_does_not_take_a_lost_files_name(self, tmp_path, db, vault, source):
+        lost = jpeg(source / "2012" / "017.jpg", "red")
+        ingest_folder(source, vault, db, dry_run=False)
+        (vault / "017.jpg").unlink()                     # the crash loses its dirent
+
+        other = tmp_path / "drive2"
+        newcomer = jpeg(other / "2014" / "017.jpg", "green")
+        ingest_folder(other, vault, db, dry_run=False)
+
+        assert db.get_file_by_path(str(vault / "017.jpg"))["blake3_full"] == hash_full(lost)
+        assert (vault / "017(1).jpg").read_bytes() == newcomer.read_bytes()
+        assert not (vault / "017.jpg").exists()
+
+    def test_lost_content_is_restored_to_its_recorded_path(self, tmp_path, db, vault, source):
+        lost = jpeg(source / "017.jpg", "red")
+        ingest_folder(source, vault, db, dry_run=False)
+        (vault / "017.jpg").unlink()
+        rows_before = db.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+
+        again = tmp_path / "drive2"
+        (again / "elsewhere").mkdir(parents=True)
+        (again / "elsewhere" / "renamed.jpg").write_bytes(lost.read_bytes())
+        stats = ingest_folder(again, vault, db, dry_run=False)
+
+        assert stats["kept"] == 1 and stats["collapsed"] == 0
+        assert (vault / "017.jpg").read_bytes() == lost.read_bytes()
+        assert not (vault / "renamed.jpg").exists()
+        assert db.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == rows_before
+        entry = db.conn.execute(
+            "SELECT kept_path, skip_reason FROM archive_entries WHERE entry_path = ?",
+            ("elsewhere/renamed.jpg",)).fetchone()
+        assert tuple(entry) == (str(vault / "017.jpg"), "prior_copy_restored")
+
+    def test_saved_file_reaches_disk_before_its_row_commits(self, db, vault, source, monkeypatch):
+        import memoryvault.ingest as ingest_mod
+
+        events = []
+        real_fsync, real_upsert = os.fsync, db.upsert_file
+
+        def fsync(fd):
+            events.append(("fsync", os.readlink(f"/proc/self/fd/{fd}")))
+            real_fsync(fd)
+
+        def upsert(**kw):
+            events.append(("row", kw["path"]))
+            real_upsert(**kw)
+
+        monkeypatch.setattr(ingest_mod.os, "fsync", fsync)
+        monkeypatch.setattr(db, "upsert_file", upsert)
+        jpeg(source / "one.jpg")
+
+        ingest_folder(source, vault, db, dry_run=False)
+
+        saved = str(vault / "one.jpg")
+        row_at = events.index(("row", saved))
+        assert ("fsync", saved) in events[:row_at], "row committed before the file's bytes were synced"
+        assert ("fsync", str(vault)) in events[:row_at], "row committed before the file's name was synced"

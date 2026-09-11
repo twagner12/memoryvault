@@ -850,9 +850,14 @@ def _process_media_entry_inner(entry: ArchiveEntry, dest_folder: Path, db: Datab
     # new — and its head-hash comparison read a column that drifts once EXIF is
     # written into a saved file.
 
-    # New file — save it
+    # New file — save it. If this very content's vault copy went missing, put
+    # it back at the recorded path so the existing row describes it again.
     filename = Path(entry.path).name
-    dest_path = _unique_dest_path(dest_folder, filename)
+    dest_path = _missing_copy_in(candidates, dest_folder)
+    if dest_path is not None:
+        keep_reason = "prior_copy_restored"
+    else:
+        dest_path = _unique_dest_path(dest_folder, filename, db)
 
     try:
         extract_entry_to_path(entry, dest_path)
@@ -884,7 +889,13 @@ def _index_saved_file(db: Database, path: Path, source_hash: str | None = None,
     `blake3_head`, `blake3_tail` and `size` always describe what is actually
     on disk. `source_blake3` is only written when supplied, so refreshing an
     existing row preserves the provenance recorded at ingest time.
+
+    The bytes are forced to disk before the row is committed. Hashing reads the
+    page cache, so without this a row can record a correct hash for bytes that
+    never reached the platter — the 2026-09-09 hot-unplug left 14 such files
+    empty and four more with no directory entry at all.
     """
+    _sync_to_disk(path)
     stat = path.stat()
     size = stat.st_size
 
@@ -1052,10 +1063,46 @@ def _copy_exif_date(target: Path, local_dt, source: Path, db: Database,
     outcome.merged.append("date")
 
 
-def _unique_dest_path(dest_folder: Path, filename: str) -> Path:
-    """Generate a unique destination path, adding (1), (2), etc. if needed."""
+def _sync_to_disk(path: Path):
+    """fsync a saved file and its directory, so both its bytes and its name survive a crash."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _missing_copy_in(candidates: list[dict], dest_folder: Path) -> Path | None:
+    """A row for this content whose vault file is gone, if there is one in dest_folder.
+
+    Restoring to that path re-attaches the row to real bytes. Saving under a new
+    name instead would leave the old row claiming a file nobody can read.
+    """
+    for c in candidates:
+        p = Path(c["path"])
+        if p.parent.resolve() == dest_folder.resolve() and not p.exists():
+            return p
+    return None
+
+
+def _unique_dest_path(dest_folder: Path, filename: str, db: Database | None = None) -> Path:
+    """Generate a unique destination path, adding (1), (2), etc. if needed.
+
+    Given `db`, a name is also taken while a files row claims it. Checking the
+    disk alone let a crash cost a photo: its directory entry was lost, the next
+    file with the same name found the path free, and the ON CONFLICT(path)
+    upsert overwrote the lost photo's row, dropping it from vault and index both.
+    """
+    def taken(p: Path) -> bool:
+        return p.exists() or (db is not None and db.get_file_by_path(str(p)) is not None)
+
     dest = dest_folder / filename
-    if not dest.exists():
+    if not taken(dest):
         return dest
 
     stem = Path(filename).stem
@@ -1063,6 +1110,6 @@ def _unique_dest_path(dest_folder: Path, filename: str) -> Path:
     counter = 1
     while True:
         dest = dest_folder / f"{stem}({counter}){suffix}"
-        if not dest.exists():
+        if not taken(dest):
             return dest
         counter += 1

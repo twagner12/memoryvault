@@ -32,7 +32,7 @@ from memoryvault.containers import detect_container
 from memoryvault.database import Database
 from memoryvault.hasher import hash_full
 from memoryvault.ingest import (
-    _index_saved_file, _try_merge_from_duplicate, _unique_dest_path,
+    _index_saved_file, _missing_copy_in, _try_merge_from_duplicate, _unique_dest_path,
     is_media_file, is_metadata_json, is_sidecar_json,
 )
 from memoryvault.metadata import can_read_exif, get_exif_date
@@ -329,13 +329,19 @@ def ingest_folder(src_root: Path, dest: Path, db: Database, *, dry_run=True,
                                      skip_reason="duplicate")
             continue
 
-        dest_path = _unique_dest_path(dest, Path(sf.rel).name)
+        # Every copy of this content is gone. If one was ours, restore it at its
+        # recorded path so its row describes real bytes again; otherwise take a
+        # name no file and no row already claims.
+        dest_path = _missing_copy_in(candidates, dest)
+        keep_reason = "prior_copy_restored" if dest_path is not None else None
+        if dest_path is None:
+            dest_path = _unique_dest_path(dest, Path(sf.rel).name, db)
         if not dry_run:
             shutil.copy2(sf.abs, dest_path)          # COPY. never move.
             _index_saved_file(db, dest_path, source_hash=digest,
                               source=f"folder:{src_root.name}")
             db.log_archive_entry(archive_id, sf.rel, "kept",
-                                 kept_path=str(dest_path))
+                                 kept_path=str(dest_path), skip_reason=keep_reason)
         stats["kept"] += 1
         if len(stats["kept_examples"]) < 200:
             stats["kept_examples"].append({"entry": sf.rel, "dest": str(dest_path)})
