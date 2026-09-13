@@ -24,6 +24,7 @@ sidecar/EXIF merge choke point, per-entry resume, and the archives ledger.
 import json
 import os
 import shutil
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,7 +33,8 @@ from memoryvault.containers import detect_container
 from memoryvault.database import Database
 from memoryvault.hasher import hash_full
 from memoryvault.ingest import (
-    _index_saved_file, _missing_copy_in, _try_merge_from_duplicate, _unique_dest_path,
+    _adoptable_copy, _index_saved_file, _missing_copy_in, _try_merge_from_duplicate,
+    _unique_dest_path,
     is_media_file, is_metadata_json, is_sidecar_json,
 )
 from memoryvault.metadata import can_read_exif, get_exif_date
@@ -209,7 +211,7 @@ def collapse_duplicate(sf: SourceFile, survivor: dict, matched_on: str,
              survivor.get("blake3_full"), matched_on,
              json.dumps(outcome.adopted), json.dumps(outcome.declined),
              datetime.now(timezone.utc).isoformat()))
-        db.conn.commit()
+        db._commit()          # deferred inside the ingest's per-entry batch
     return outcome
 
 
@@ -269,85 +271,95 @@ def ingest_folder(src_root: Path, dest: Path, db: Database, *, dry_run=True,
 
     files = iter_source_files(src_root, exclude={dest, dest.parent / (dest.name + ".mvtmp")})
     for i, sf in enumerate(files, 1):
-        if limit and stats["seen"] >= limit:
-            break
-        if sf.rel in already:
-            continue
-        stats["seen"] += 1
+        # One commit per entry (a dry run writes nothing, so nothing to batch).
+        with (nullcontext() if dry_run else db.batch()):
+            if limit and stats["seen"] >= limit:
+                break
+            if sf.rel in already:
+                continue
+            stats["seen"] += 1
 
-        if is_metadata_json(sf.rel) or is_sidecar_json(sf.rel):
-            stats["skipped"] += 1
-            stats["skip_reasons"]["sidecar"] = \
-                stats["skip_reasons"].get("sidecar", 0) + 1
+            if is_metadata_json(sf.rel) or is_sidecar_json(sf.rel):
+                stats["skipped"] += 1
+                stats["skip_reasons"]["sidecar"] = \
+                    stats["skip_reasons"].get("sidecar", 0) + 1
+                if not dry_run:
+                    db.log_archive_entry(archive_id, sf.rel, "skipped",
+                                         skip_reason="sidecar")
+                continue
+
+            # The same predicate the archive path uses, so a camera's own droppings
+            # — Sony .modd, Apple .aae edit sidecars, .orig backups — do not enter
+            # the vault as if they were photographs. Extension-based, which is safe
+            # for exclusion even though extensions lie for 28.8% of the vault: a
+            # .modd is never a JPEG in disguise.
+            if not is_media_file(sf.rel):
+                stats["skipped"] += 1
+                stats["skip_reasons"]["not_media"] = \
+                    stats["skip_reasons"].get("not_media", 0) + 1
+                if len(stats["skipped_examples"]) < 200:
+                    stats["skipped_examples"].append((sf.rel, "not_media"))
+                if not dry_run:
+                    db.log_archive_entry(archive_id, sf.rel, "skipped",
+                                         skip_reason="not_media")
+                continue
+
+            try:
+                digest = hash_full(sf.abs)
+            except OSError as exc:
+                stats["errors"] += 1
+                if not dry_run:
+                    db.log_archive_entry(archive_id, sf.rel, "error",
+                                         skip_reason=f"read_failed:{exc}"[:200])
+                continue
+
+            candidates = db.find_files_by_content_hash(digest)
+            surviving = [c for c in candidates if Path(c["path"]).exists()]
+            if surviving:
+                survivor = surviving[0]
+                matched = ("blake3_full" if survivor.get("blake3_full") == digest
+                           else "source_blake3")
+                outcome = collapse_duplicate(sf, survivor, matched, db, archive_id,
+                                             src_root, dry_run)
+                stats["collapsed"] += 1
+                if any(a["what"] == "mtime" for a in outcome.adopted):
+                    stats["adopted_mtime"] += 1
+                if len(stats["collapses"]) < 200:
+                    stats["collapses"].append(
+                        {"entry": sf.rel, "survivor": survivor["path"],
+                         "adopted": outcome.adopted, "declined": outcome.declined})
+                if not dry_run:
+                    db.log_archive_entry(archive_id, sf.rel, "skipped",
+                                         skip_reason="duplicate")
+                continue
+
+            # Every copy of this content is gone. If one was ours, restore it at its
+            # recorded path so its row describes real bytes again; otherwise take a
+            # name no file and no row already claims.
+            dest_path = _missing_copy_in(candidates, dest)
+            keep_reason = "prior_copy_restored" if dest_path is not None else None
+            adopted = False
+            if dest_path is None:
+                # A crash between the copy and this entry's commit leaves an
+                # unrecorded copy of exactly these bytes: record it, don't copy again.
+                dest_path = _adoptable_copy(dest, Path(sf.rel).name, digest, db)
+                if dest_path is not None:
+                    keep_reason, adopted = "orphan_adopted", True
+                else:
+                    dest_path = _unique_dest_path(dest, Path(sf.rel).name, db)
             if not dry_run:
-                db.log_archive_entry(archive_id, sf.rel, "skipped",
-                                     skip_reason="sidecar")
-            continue
+                if not adopted:
+                    shutil.copy2(sf.abs, dest_path)      # COPY. never move.
+                _index_saved_file(db, dest_path, source_hash=digest,
+                                  source=f"folder:{src_root.name}")
+                db.log_archive_entry(archive_id, sf.rel, "kept",
+                                     kept_path=str(dest_path), skip_reason=keep_reason)
+            stats["kept"] += 1
+            if len(stats["kept_examples"]) < 200:
+                stats["kept_examples"].append({"entry": sf.rel, "dest": str(dest_path)})
 
-        # The same predicate the archive path uses, so a camera's own droppings
-        # — Sony .modd, Apple .aae edit sidecars, .orig backups — do not enter
-        # the vault as if they were photographs. Extension-based, which is safe
-        # for exclusion even though extensions lie for 28.8% of the vault: a
-        # .modd is never a JPEG in disguise.
-        if not is_media_file(sf.rel):
-            stats["skipped"] += 1
-            stats["skip_reasons"]["not_media"] = \
-                stats["skip_reasons"].get("not_media", 0) + 1
-            if len(stats["skipped_examples"]) < 200:
-                stats["skipped_examples"].append((sf.rel, "not_media"))
-            if not dry_run:
-                db.log_archive_entry(archive_id, sf.rel, "skipped",
-                                     skip_reason="not_media")
-            continue
-
-        try:
-            digest = hash_full(sf.abs)
-        except OSError as exc:
-            stats["errors"] += 1
-            if not dry_run:
-                db.log_archive_entry(archive_id, sf.rel, "error",
-                                     skip_reason=f"read_failed:{exc}"[:200])
-            continue
-
-        candidates = db.find_files_by_content_hash(digest)
-        surviving = [c for c in candidates if Path(c["path"]).exists()]
-        if surviving:
-            survivor = surviving[0]
-            matched = ("blake3_full" if survivor.get("blake3_full") == digest
-                       else "source_blake3")
-            outcome = collapse_duplicate(sf, survivor, matched, db, archive_id,
-                                         src_root, dry_run)
-            stats["collapsed"] += 1
-            if any(a["what"] == "mtime" for a in outcome.adopted):
-                stats["adopted_mtime"] += 1
-            if len(stats["collapses"]) < 200:
-                stats["collapses"].append(
-                    {"entry": sf.rel, "survivor": survivor["path"],
-                     "adopted": outcome.adopted, "declined": outcome.declined})
-            if not dry_run:
-                db.log_archive_entry(archive_id, sf.rel, "skipped",
-                                     skip_reason="duplicate")
-            continue
-
-        # Every copy of this content is gone. If one was ours, restore it at its
-        # recorded path so its row describes real bytes again; otherwise take a
-        # name no file and no row already claims.
-        dest_path = _missing_copy_in(candidates, dest)
-        keep_reason = "prior_copy_restored" if dest_path is not None else None
-        if dest_path is None:
-            dest_path = _unique_dest_path(dest, Path(sf.rel).name, db)
-        if not dry_run:
-            shutil.copy2(sf.abs, dest_path)          # COPY. never move.
-            _index_saved_file(db, dest_path, source_hash=digest,
-                              source=f"folder:{src_root.name}")
-            db.log_archive_entry(archive_id, sf.rel, "kept",
-                                 kept_path=str(dest_path), skip_reason=keep_reason)
-        stats["kept"] += 1
-        if len(stats["kept_examples"]) < 200:
-            stats["kept_examples"].append({"entry": sf.rel, "dest": str(dest_path)})
-
-        if progress and stats["seen"] % 100 == 0:
-            progress(stats["seen"], len(files))
+            if progress and stats["seen"] % 100 == 0:
+                progress(stats["seen"], len(files))
 
     if not dry_run:
         db.update_archive_status(archive_id, "complete",

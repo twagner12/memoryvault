@@ -371,3 +371,85 @@ class TestCrashSafety:
         row_at = events.index(("row", saved))
         assert ("fsync", saved) in events[:row_at], "row committed before the file's bytes were synced"
         assert ("fsync", str(vault)) in events[:row_at], "row committed before the file's name was synced"
+
+
+from memoryvault.database import Database
+
+
+class TestOneCommitPerEntry:
+    """Each entry's rows land in one commit; a crash's leftover copy is adopted (2026-09-13).
+
+    Batching opens a window a per-write commit did not have: the file is copied
+    and fsynced, then a crash rolls its rows back, leaving a copy with no row.
+    The resumed run must record that copy, not save a second one beside it.
+    """
+
+    @staticmethod
+    def _counting(db):
+        real = db.conn
+
+        class Counting:
+            commits = 0
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def commit(self):
+                Counting.commits += 1
+                real.commit()
+
+        db.conn = Counting()
+        return Counting, real
+
+    def test_each_kept_file_costs_one_commit(self, tmp_path):
+        counts = []
+        for n in (1, 3):
+            src, dst = tmp_path / f"src{n}", tmp_path / f"vault{n}"
+            for i in range(n):
+                jpeg(src / f"p{i}.jpg", ("red", "green", "blue")[i])
+            db = Database(tmp_path / f"db{n}.db")
+            Counting, real = self._counting(db)
+            try:
+                ingest_folder(src, dst, db, dry_run=False)
+            finally:
+                db.conn = real
+                db.close()
+            counts.append(Counting.commits)
+        assert counts[1] - counts[0] == 2, counts
+
+    def test_a_crash_before_the_commit_leaves_a_copy_that_resume_adopts(
+            self, db, vault, source, monkeypatch):
+        src = jpeg(source / "one.jpg", "red")
+        real_log = db.log_archive_entry
+
+        def killed(archive_id, entry_path, status, **kw):
+            if status == "kept":
+                raise KeyboardInterrupt("power cut")   # BaseException, like a kill
+            return real_log(archive_id, entry_path, status, **kw)
+
+        monkeypatch.setattr(db, "log_archive_entry", killed)
+        with pytest.raises(KeyboardInterrupt):
+            ingest_folder(source, vault, db, dry_run=False)
+        assert (vault / "one.jpg").exists(), "setup: the copy reached disk"
+        assert db.get_file_by_path(str(vault / "one.jpg")) is None, "setup: its row rolled back"
+        monkeypatch.setattr(db, "log_archive_entry", real_log)
+
+        stats = ingest_folder(source, vault, db, dry_run=False)
+
+        assert stats["kept"] == 1
+        assert sorted(p.name for p in vault.iterdir()) == ["one.jpg"], "no second copy"
+        assert db.get_file_by_path(str(vault / "one.jpg"))["source_blake3"] == hash_full(src)
+        row = db.conn.execute("SELECT kept_path, skip_reason FROM archive_entries "
+                              "WHERE entry_path = 'one.jpg'").fetchone()
+        assert tuple(row) == (str(vault / "one.jpg"), "orphan_adopted")
+
+    def test_a_different_file_at_the_name_is_never_adopted(self, db, vault, source):
+        jpeg(source / "one.jpg", "red")
+        stranger = jpeg(vault / "one.jpg", "green")     # unrecorded, different bytes
+        before = stranger.read_bytes()
+
+        ingest_folder(source, vault, db, dry_run=False)
+
+        assert stranger.read_bytes() == before
+        assert (vault / "one(1).jpg").exists()
+        assert db.get_file_by_path(str(vault / "one.jpg")) is None

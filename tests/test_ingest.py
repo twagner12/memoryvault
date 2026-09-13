@@ -238,3 +238,70 @@ class TestIngestArchive:
         files = list(dest.iterdir())
         assert len(files) == 2
         db.close()
+
+
+import pytest
+
+
+class TestOneCommitPerEntryArchive:
+    """Takeout path: one commit per entry, and resume adopts a crash's leftover copy (2026-09-13)."""
+
+    def test_each_entry_costs_one_commit(self, tmp_path):
+        counts = []
+        for n in (1, 3):
+            files = {}
+            for i in range(n):
+                im = Image.new("RGB", (10 + i, 10), color=("red", "green", "blue")[i])
+                buf = io.BytesIO(); im.save(buf, format="JPEG")
+                files[f"Google Photos/001/p{i}.jpg"] = buf.getvalue()
+            zp = _make_takeout_zip(tmp_path / f"t{n}.zip", files)
+            db = Database(tmp_path / f"db{n}.db")
+            real = db.conn
+
+            class Counting:
+                commits = 0
+
+                def __getattr__(self, name):
+                    return getattr(real, name)
+
+                def commit(self):
+                    Counting.commits += 1
+                    real.commit()
+
+            db.conn = Counting()
+            try:
+                ingest_archive(zp, tmp_path / f"out{n}", db)
+            finally:
+                db.conn = real
+                db.close()
+            counts.append(Counting.commits)
+        assert counts[1] - counts[0] == 2, counts
+
+    def test_resume_adopts_the_orphan_instead_of_copying_again(self, tmp_path, monkeypatch):
+        zp = _make_takeout_zip(tmp_path / "takeout.zip",
+                               {"Google Photos/001/photo1.jpg": _make_jpeg_bytes()})
+        dest = tmp_path / "output"
+        db = Database(tmp_path / "test.db")
+        real_log = db.log_archive_entry
+
+        def killed(archive_id, entry_path, status, **kw):
+            if status == "kept":
+                raise KeyboardInterrupt("power cut")   # not caught per entry, like a kill
+            return real_log(archive_id, entry_path, status, **kw)
+
+        monkeypatch.setattr(db, "log_archive_entry", killed)
+        with pytest.raises(KeyboardInterrupt):
+            ingest_archive(zp, dest, db)
+        assert (dest / "photo1.jpg").exists(), "setup: the copy reached disk"
+        assert db.file_count() == 0, "setup: its row rolled back"
+        monkeypatch.setattr(db, "log_archive_entry", real_log)
+
+        stats = ingest_archive(zp, dest, db)
+
+        assert stats["kept"] == 1
+        assert sorted(p.name for p in dest.iterdir() if p.is_file()) == ["photo1.jpg"]
+        assert db.file_count() == 1
+        row = db.conn.execute("SELECT skip_reason FROM archive_entries "
+                              "WHERE entry_path LIKE '%photo1.jpg'").fetchone()
+        assert row[0] == "orphan_adopted"
+        db.close()
