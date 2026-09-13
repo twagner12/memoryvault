@@ -95,3 +95,47 @@ class TestDatabase:
         ).fetchall()
         assert len(rows) == 2
         db.close()
+
+
+import sqlite3
+
+import pytest
+
+
+class TestBatch:
+    """db.batch(): one commit for a unit of work, or none of it (2026-09-13)."""
+
+    @staticmethod
+    def _committed_log_rows(db):
+        # A second connection sees only what has been committed.
+        other = sqlite3.connect(str(db.db_path))
+        try:
+            return other.execute("SELECT COUNT(*) FROM metadata_log").fetchone()[0]
+        finally:
+            other.close()
+
+    def test_writes_are_invisible_until_the_batch_ends(self, db):
+        with db.batch():
+            db.log_metadata_merge("/v/a.jpg", "t", "date", "x")
+            db.log_metadata_merge("/v/a.jpg", "t", "gps", "y")
+            assert self._committed_log_rows(db) == 0
+        assert self._committed_log_rows(db) == 2
+
+    def test_an_exception_rolls_every_write_back(self, db):
+        with pytest.raises(RuntimeError):
+            with db.batch():
+                db.log_metadata_merge("/v/a.jpg", "t", "date", "x")
+                raise RuntimeError("boom")
+        assert self._committed_log_rows(db) == 0
+        assert db.conn.execute("SELECT COUNT(*) FROM metadata_log").fetchone()[0] == 0
+
+    def test_nested_batches_commit_once_at_the_outermost(self, db):
+        with db.batch():
+            with db.batch():
+                db.log_metadata_merge("/v/a.jpg", "t", "date", "x")
+            assert self._committed_log_rows(db) == 0
+        assert self._committed_log_rows(db) == 1
+
+    def test_outside_a_batch_each_write_still_commits(self, db):
+        db.log_metadata_merge("/v/a.jpg", "t", "date", "x")
+        assert self._committed_log_rows(db) == 1

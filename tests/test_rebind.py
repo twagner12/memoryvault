@@ -420,3 +420,51 @@ class TestNothingToDo:
 
         assert stats["bound"] == 0
         assert stats["refused"] == {"no_payload": 1}
+
+
+class TestOneCommitPerBind:
+    """Each bind's rows land in a single commit, or not at all (2026-09-13).
+
+    On the vault's USB drive every commit is an fsync, and a bind used to make
+    about four. Batching them is the speed-up; all-or-nothing is the safety.
+    """
+
+    @staticmethod
+    def _split(ingest):
+        ingest({"T/P/img.jpg.supplemental-metadata.json":
+                make_sidecar_bytes(TS, **CHICAGO)})
+        ingest({"T/P/img.jpg": make_jpeg_bytes(color="red")})
+
+    def test_a_failure_while_marking_rolls_back_the_whole_bind(
+            self, db, ingest, monkeypatch):
+        self._split(ingest)
+        logs_before = db.conn.execute("SELECT COUNT(*) FROM metadata_log").fetchone()[0]
+
+        def disk_gone(*args, **kwargs):
+            raise RuntimeError("disk gone")
+        monkeypatch.setattr(db, "mark_sidecar_rebound", disk_gone)
+
+        assert rebind_sidecars(db)["bound"] == 0
+        assert db.conn.execute("SELECT COUNT(*) FROM metadata_log").fetchone()[0] == logs_before
+        assert len(db.get_unmatched()) == 1, "the row must be re-offered next run"
+
+    def test_a_bind_makes_exactly_one_commit(self, db, ingest):
+        self._split(ingest)
+        real = db.conn
+
+        class Counting:
+            commits = 0
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def commit(self):
+                Counting.commits += 1
+                real.commit()
+
+        db.conn = Counting()
+        try:
+            assert rebind_sidecars(db)["bound"] == 1
+        finally:
+            db.conn = real
+        assert Counting.commits == 1

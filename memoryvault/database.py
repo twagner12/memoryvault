@@ -220,6 +220,7 @@ class Database:
         """
         self.db_path = db_path
         self.read_only = read_only
+        self._batch_depth = 0
 
         if read_only:
             self.conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -262,12 +263,48 @@ class Database:
 
     @contextmanager
     def transaction(self):
+        if self._batch_depth:          # inside batch(): the batch owns the commit
+            yield self.conn
+            return
         try:
             yield self.conn
             self.conn.commit()
         except Exception:
             self.conn.rollback()
             raise
+
+    @contextmanager
+    def batch(self):
+        """Group every write inside into ONE commit: all of it lands, or none.
+
+        Outside a batch the per-write methods below commit individually. On the
+        vault's USB drive each commit is an fsync (~60 ms, measured 2026-09-13),
+        so a unit of work making four of them (a metadata log row, the file's
+        re-index, a sidecar's rebound mark) spends most of its time flushing.
+        Inside a batch they defer to a single commit at the end, and a failure
+        rolls all of them back together, so a crash cannot leave a unit
+        half-recorded. Nests: only the outermost batch commits or rolls back.
+
+        Callers keep the ordering `_index_saved_file` enforces: a file's bytes
+        are fsynced before the commit that describes them.
+        """
+        self._batch_depth += 1
+        try:
+            yield self
+        except BaseException:
+            self._batch_depth -= 1
+            if not self._batch_depth:
+                self.conn.rollback()
+            raise
+        else:
+            self._batch_depth -= 1
+            if not self._batch_depth:
+                self.conn.commit()
+
+    def _commit(self):
+        """Commit now, unless an enclosing batch() will commit for us."""
+        if not self._batch_depth:
+            self.conn.commit()
 
     # --- File operations ---
 
@@ -282,7 +319,7 @@ class Database:
             f"ON CONFLICT(path) DO UPDATE SET {updates}",
             kwargs,
         )
-        self.conn.commit()
+        self._commit()
 
     def bulk_upsert_files(self, records: list[dict]):
         """Insert or update multiple file records in a single transaction."""
@@ -371,7 +408,7 @@ class Database:
             (path, blake3, entries_total, title),
         )
         row = cursor.fetchone()
-        self.conn.commit()
+        self._commit()
         return row["id"]
 
     def get_archive(self, path: str) -> dict | None:
@@ -390,7 +427,7 @@ class Database:
                 "UPDATE archives SET status = ?, completed_at = COALESCE(?, completed_at) WHERE id = ?",
                 (status, completed_at, archive_id),
             )
-        self.conn.commit()
+        self._commit()
 
     def log_archive_entry(self, archive_id: int, entry_path: str, status: str,
                           kept_path: str = None, skip_reason: str = None):
@@ -401,7 +438,7 @@ class Database:
             "status=excluded.status, kept_path=excluded.kept_path, skip_reason=excluded.skip_reason",
             (archive_id, entry_path, status, kept_path, skip_reason),
         )
-        self.conn.commit()
+        self._commit()
 
     # Entries that are neither media nor a candidate for one. Excluded when the
     # rebind pass builds its per-directory listings, so a sidecar can never be
@@ -441,7 +478,7 @@ class Database:
             (datetime.now(timezone.utc).isoformat(), target_path, outcome,
              sidecar_id),
         )
-        self.conn.commit()
+        self._commit()
 
     def get_processed_entries(self, archive_id: int) -> set[str]:
         rows = self.conn.execute(
@@ -473,7 +510,7 @@ class Database:
             "VALUES (?, ?, ?, ?, ?)",
             (target_path, source_desc, field, value, datetime.now(timezone.utc).isoformat()),
         )
-        self.conn.commit()
+        self._commit()
 
     # --- Metadata pending (deferred / failed) ---
 
@@ -500,7 +537,7 @@ class Database:
              source_desc, datetime.now(timezone.utc).isoformat()),
         )
         row = cursor.fetchone()
-        self.conn.commit()
+        self._commit()
         return row["id"]
 
     def has_outstanding_pending(self, file_path: str, field: str,
@@ -560,7 +597,7 @@ class Database:
              datetime.now(timezone.utc).isoformat()),
         )
         row = cursor.fetchone()
-        self.conn.commit()
+        self._commit()
         return row["id"]
 
     def get_unmatched_summary(self) -> list[dict]:
@@ -590,7 +627,7 @@ class Database:
             (blake3_full, winner_path, action, confidence,
              datetime.now(timezone.utc).isoformat(), auto_resolved),
         )
-        self.conn.commit()
+        self._commit()
 
     def is_resolved(self, blake3_full: str) -> bool:
         """True only for verdicts that still count. Stale rows do not."""

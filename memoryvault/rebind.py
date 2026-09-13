@@ -84,9 +84,9 @@ def rebind_sidecars(db: Database, dry_run: bool = False,
                 _apply_and_mark(db, bind)
             except Exception as exc:
                 # Per sidecar, so one unwritable file cannot strand the pass.
-                # The row keeps rebound_at NULL and will be re-offered; a
-                # refused write has already been recorded in metadata_pending
-                # by apply_sidecar, so nothing here is a silent loss.
+                # The batch in _apply_and_mark rolled back every row this bind
+                # wrote; the row keeps rebound_at NULL and will be re-offered
+                # with its payload, so nothing here is a silent loss.
                 logger.warning("rebind failed for %s -> %s: %s",
                                bind.row["sidecar_path"], bind.target, exc)
                 refused[f"apply_error:{type(exc).__name__}"] += 1
@@ -241,25 +241,31 @@ def _directory_index(db: Database) -> tuple[dict[str, set[str]],
 
 
 def _apply_and_mark(db: Database, bind: Bind):
-    """Apply one sidecar's payload, then record that it bound.
+    """Apply one sidecar's payload and record that it bound, as ONE commit.
 
-    In that order: a crash between the two leaves the row outstanding and the
-    next run re-offers it, which the guards in `apply_sidecar` make a no-op.
-    The reverse order would lose the value outright.
+    The file is written and fsynced first (inside `_apply_sidecar_to_file`);
+    every row the bind produces (the metadata log, the file's re-index, the
+    rebound marks) then lands in a single `db.batch()` commit. A failure before
+    that commit rolls them all back together: the row keeps `rebound_at` NULL
+    and the next run re-offers it, which the guards in `apply_sidecar` make a
+    no-op. Recording the bind before applying would lose the value outright.
+    One commit instead of about four is also what makes the pass faster on
+    the USB vault drive, where each commit is an fsync.
     """
-    outcome = _apply_sidecar_to_file(
-        str(bind.target), json.loads(bind.row["payload"]),
-        bind.row["sidecar_path"], db)
+    with db.batch():
+        outcome = _apply_sidecar_to_file(
+            str(bind.target), json.loads(bind.row["payload"]),
+            bind.row["sidecar_path"], db)
 
-    summary = json.dumps({
-        "merged": outcome.merged,
-        "merged_mtime_only": outcome.merged_mtime_only,
-        "deferred": outcome.deferred,
-        "failed": outcome.failed,
-        "already_present": outcome.already_present,
-        "media_name": bind.media_name,
-        "relocated": bind.relocated,
-    })
+        summary = json.dumps({
+            "merged": outcome.merged,
+            "merged_mtime_only": outcome.merged_mtime_only,
+            "deferred": outcome.deferred,
+            "failed": outcome.failed,
+            "already_present": outcome.already_present,
+            "media_name": bind.media_name,
+            "relocated": bind.relocated,
+        })
 
-    for sidecar_id in [bind.row["id"], *bind.duplicate_ids]:
-        db.mark_sidecar_rebound(sidecar_id, str(bind.target), summary)
+        for sidecar_id in [bind.row["id"], *bind.duplicate_ids]:
+            db.mark_sidecar_rebound(sidecar_id, str(bind.target), summary)
